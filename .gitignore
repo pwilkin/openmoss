@@ -1,0 +1,9 @@
+build/
+build-*/
+*.gguf
+*.safetensors
+*.npy
+weights/
+__pycache__/
+*.pyc
+.cache/
