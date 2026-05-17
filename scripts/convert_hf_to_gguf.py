@@ -506,12 +506,17 @@ def collect_codec_tensors(codec_dir: Path):
 
 def write_moss_sidecar(out_gguf: Path,
                        moss_config: dict, moss_dir: Path,
-                       codec_dir: Path | None) -> None:
+                       codec_dir: Path | None,
+                       llama_cpp_dir: Path | None = None) -> None:
     """Write the MOSS extras (audio embeddings, audio heads, optional codec,
     plus the moss.* KV namespace) into a sidecar GGUF.
 
     The C++ loader opens this file alongside the backbone GGUF.
     """
+    if llama_cpp_dir is not None:
+        gguf_py = str((llama_cpp_dir / "gguf-py").resolve())
+        if gguf_py not in sys.path:
+            sys.path.insert(0, gguf_py)
     import gguf
 
     writer = gguf.GGUFWriter(str(out_gguf), "moss_tts_delay")
@@ -651,7 +656,8 @@ def main():
 
         sidecar_path = out_path.with_suffix(".extras.gguf")
         log.info("=== stage 3b: write MOSS sidecar → %s ===", sidecar_path)
-        write_moss_sidecar(sidecar_path, moss_config, moss_dir, codec_dir)
+        write_moss_sidecar(sidecar_path, moss_config, moss_dir, codec_dir,
+                           Path(args.llama_cpp_dir))
     finally:
         if cleanup_scratch:
             shutil.rmtree(scratch, ignore_errors=True)
