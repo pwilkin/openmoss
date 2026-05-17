@@ -72,6 +72,8 @@ namespace {
         "  --main-gpu N           (default: -1 = auto, picks GPU with most free VRAM)\n"
         "  --no-flash-attn\n"
         "  --skip-codec           (no waveform synthesis; codes only — debug)\n"
+        "  --aux-cpu              force audio embeds + codec onto CPU\n"
+        "                          (workaround for Metal DIAG_MASK_INF)\n"
         "  --webui-dir DIR        serve a static WebUI from DIR at /\n"
         "                          (default: auto-detect ./webui or <binary>/webui)\n"
         "  --no-webui             disable WebUI auto-detection\n"
@@ -178,6 +180,7 @@ int main(int argc, char ** argv) {
     int  main_gpu     = -1;
     bool flash_attn   = true;
     bool skip_codec   = false;
+    bool aux_cpu      = false;
     std::string webui_dir_arg;
     bool no_webui     = false;
 
@@ -194,6 +197,7 @@ int main(int argc, char ** argv) {
         else if (k == "--main-gpu")       main_gpu     = std::atoi(next().c_str());
         else if (k == "--no-flash-attn")  flash_attn   = false;
         else if (k == "--skip-codec")     skip_codec   = true;
+        else if (k == "--aux-cpu")        aux_cpu      = true;
         else if (k == "--webui-dir")      webui_dir_arg = next();
         else if (k == "--no-webui")       no_webui     = true;
         else if (k == "--help" || k == "-h") usage(0);
@@ -206,6 +210,7 @@ int main(int argc, char ** argv) {
     lo.main_gpu     = main_gpu;
     lo.flash_attn   = flash_attn;
     lo.skip_codec   = skip_codec;
+    lo.aux_cpu      = aux_cpu;
     auto model = openmoss::Model::load(model_path, lo);
     std::fprintf(stderr,
                   "[server] model loaded; codec=%s\n",

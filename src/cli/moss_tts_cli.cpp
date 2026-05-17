@@ -27,6 +27,7 @@ struct Args {
     int  max_new_tokens = 4096;
     bool flash_attn = true;
     bool skip_codec = false;
+    bool aux_cpu    = false;
 };
 
 [[noreturn]] void usage(int code) {
@@ -50,6 +51,9 @@ struct Args {
         "  --no-flash-attn        Disable flash attention\n"
         "  --skip-codec           Don't load codec tensors (saves ~3.4 GB VRAM,\n"
         "                         disables waveform synthesis)\n"
+        "  --aux-cpu              Force audio embeds + codec onto CPU (workaround\n"
+        "                         for backends missing ops, e.g. Metal DIAG_MASK_INF).\n"
+        "                         Backbone still uses the GPU.\n"
     );
     std::exit(code);
 }
@@ -80,6 +84,7 @@ int main(int argc, char ** argv) {
         else if (k == "--main-gpu")        a.main_gpu     = require_int(i, argc, argv);
         else if (k == "--no-flash-attn")   a.flash_attn = false;
         else if (k == "--skip-codec")      a.skip_codec = true;
+        else if (k == "--aux-cpu")         a.aux_cpu    = true;
         else if (k == "--help" || k == "-h") usage(0);
         else { std::fprintf(stderr, "unknown arg: %s\n", k.c_str()); usage(2); }
     }
@@ -90,6 +95,7 @@ int main(int argc, char ** argv) {
     lo.main_gpu     = a.main_gpu;
     lo.flash_attn   = a.flash_attn;
     lo.skip_codec   = a.skip_codec;
+    lo.aux_cpu      = a.aux_cpu;
     auto model = openmoss::Model::load(a.model_path, lo);
 
     openmoss::GenerateRequest req;

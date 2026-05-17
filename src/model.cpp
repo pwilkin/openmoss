@@ -370,10 +370,12 @@ std::unique_ptr<Model> Model::load(const std::string & gguf_path, const LoadOpti
     }
     bb_spec.wanted.emplace_back("token_embd.weight", "_text_embed");
 
-    if (picked_dev) {
+    if (picked_dev && !opts.aux_cpu) {
         self->m_aux->backend = ggml_backend_dev_init(picked_dev, nullptr);
     } else {
-        // No GPU? Fall through to CPU backend so we still build something.
+        // No GPU, or aux_cpu requested. Fall through to CPU backend so we
+        // still build something (and keep the backbone wherever libllama
+        // placed it via n_gpu_layers / main_gpu).
         self->m_aux->backend = ggml_backend_init_by_type(
             GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }

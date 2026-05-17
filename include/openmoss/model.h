@@ -60,6 +60,12 @@ struct LoadOptions {
     // ~3.4 GB of VRAM. Set to true when you only need the LM-side outputs
     // (audio codes, no waveform). Default: load codec when present.
     bool    skip_codec   = false;
+
+    // Force the aux backend (audio embeds + codec graphs) onto CPU even when
+    // a GPU is available. Workaround for backends that don't implement every
+    // op the codec needs (e.g. llama.cpp Metal lacks DIAG_MASK_INF). The
+    // backbone still uses the GPU via libllama. Default: follow main_gpu.
+    bool    aux_cpu      = false;
 };
 
 // Forward decl; implemented in model.cpp.
