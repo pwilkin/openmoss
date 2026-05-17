@@ -8,6 +8,7 @@
 // ---
 //   GET  /health                       → "ok\n"  (200)
 //   GET  /info                         → JSON with model dims + load options
+//   GET  /  (and other static paths)   → WebUI (when --webui-dir is set)
 //   POST /v1/audio/speech              → OpenAI-compatible TTS endpoint
 //   POST /tts
 //        Content-Type: application/json
@@ -44,6 +45,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -70,8 +72,44 @@ namespace {
         "  --main-gpu N           (default: -1 = auto, picks GPU with most free VRAM)\n"
         "  --no-flash-attn\n"
         "  --skip-codec           (no waveform synthesis; codes only — debug)\n"
+        "  --webui-dir DIR        serve a static WebUI from DIR at /\n"
+        "                          (default: auto-detect ./webui or <binary>/webui)\n"
+        "  --no-webui             disable WebUI auto-detection\n"
     );
     std::exit(code);
+}
+
+// Resolve a usable WebUI directory. Honor an explicit override first, otherwise
+// look in a couple of conventional spots: the CWD, the binary's directory, and
+// one level up (so `build/moss-tts-server` finds `../webui`).
+std::string find_webui_dir(const std::string & explicit_dir,
+                            const std::string & argv0) {
+    namespace fs = std::filesystem;
+    auto check = [](const fs::path & p) -> std::string {
+        std::error_code ec;
+        if (fs::is_directory(p, ec) && fs::exists(p / "index.html", ec)) {
+            return fs::absolute(p, ec).string();
+        }
+        return {};
+    };
+
+    if (!explicit_dir.empty()) {
+        auto r = check(explicit_dir);
+        if (!r.empty()) return r;
+        std::fprintf(stderr,
+            "[server] --webui-dir '%s' is not a directory containing index.html\n",
+            explicit_dir.c_str());
+        return {};
+    }
+
+    if (auto r = check(fs::path("webui")); !r.empty()) return r;
+
+    std::error_code ec;
+    fs::path exe(argv0);
+    fs::path exe_dir = fs::absolute(exe, ec).parent_path();
+    if (auto r = check(exe_dir / "webui"); !r.empty()) return r;
+    if (auto r = check(exe_dir.parent_path() / "webui"); !r.empty()) return r;
+    return {};
 }
 
 // ── tiny base64 decoder ───────────────────────────────────────────────────
@@ -140,6 +178,8 @@ int main(int argc, char ** argv) {
     int  main_gpu     = -1;
     bool flash_attn   = true;
     bool skip_codec   = false;
+    std::string webui_dir_arg;
+    bool no_webui     = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
@@ -154,6 +194,8 @@ int main(int argc, char ** argv) {
         else if (k == "--main-gpu")       main_gpu     = std::atoi(next().c_str());
         else if (k == "--no-flash-attn")  flash_attn   = false;
         else if (k == "--skip-codec")     skip_codec   = true;
+        else if (k == "--webui-dir")      webui_dir_arg = next();
+        else if (k == "--no-webui")       no_webui     = true;
         else if (k == "--help" || k == "-h") usage(0);
         else { std::fprintf(stderr, "unknown arg: %s\n", k.c_str()); usage(2); }
     }
@@ -174,6 +216,19 @@ int main(int argc, char ** argv) {
     // Larger payload allowance: a 60 s reference WAV is ~5.7 MB raw + ~7.6 MB
     // base64. Round up to keep some slack for headers + JSON overhead.
     svr.set_payload_max_length(64 * 1024 * 1024);
+
+    // Permissive CORS so the WebUI works whether served from this server or
+    // from a different origin during development.
+    svr.set_pre_routing_handler([](const httplib::Request & rq, httplib::Response & rs) {
+        rs.set_header("Access-Control-Allow-Origin", "*");
+        rs.set_header("Access-Control-Allow-Headers", "Content-Type");
+        rs.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        if (rq.method == "OPTIONS") {
+            rs.status = 204;
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
 
     std::mutex gen_mu;
     std::atomic<uint64_t> n_requests{0};
@@ -373,6 +428,21 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[server] %s %s → %d\n",
                       rq.method.c_str(), rq.path.c_str(), rs.status);
     });
+
+    // Static WebUI mount. The mount is added last so the JSON / audio
+    // handlers above always take precedence on path conflicts.
+    if (!no_webui) {
+        std::string webui_dir = find_webui_dir(webui_dir_arg, argv[0]);
+        if (!webui_dir.empty()) {
+            svr.set_mount_point("/", webui_dir);
+            std::fprintf(stderr, "[server] WebUI mounted at / from %s\n",
+                          webui_dir.c_str());
+        } else if (!webui_dir_arg.empty()) {
+            std::fprintf(stderr, "[server] WebUI disabled (override path invalid)\n");
+        } else {
+            std::fprintf(stderr, "[server] WebUI not found; pass --webui-dir DIR to enable\n");
+        }
+    }
 
     std::fprintf(stderr, "[server] listening on http://%s:%d\n", host.c_str(), port);
     if (!svr.listen(host, port)) {

@@ -11,7 +11,8 @@ Two entry points:
 - **`moss-tts-cli`** — one-shot synthesis. Loads the model, synthesizes one utterance, writes a
   WAV, exits.
 - **`moss-tts-server`** — keeps the model resident and exposes an HTTP API for repeated
-  generations (TTS and voice cloning).
+  generations (TTS and voice cloning). Also serves a small browser **WebUI** with a per-browser
+  history of generated audio (IndexedDB). See [WebUI](#webui).
 
 On a single 16 GB GPU (RTX 5060 Ti) the Q8\_0 backbone produces ~10 s of speech in ~4 s of
 wall-clock; the codec runs at ~50× real-time. See `docs/STATUS.md` for a detailed feature matrix,
@@ -192,6 +193,17 @@ clean speech is usually enough.
 `--skip-codec` flags as the CLI. Generations are serialized through a single mutex (libllama
 state is not reentrant); concurrent requests queue cleanly.
 
+Additional flags:
+
+| flag                | meaning                                                              |
+|---------------------|----------------------------------------------------------------------|
+| `--webui-dir DIR`   | serve a static WebUI from `DIR` at `/` (overrides auto-detection)    |
+| `--no-webui`        | disable WebUI even if a `webui/` directory is found                  |
+
+By default the server auto-detects `./webui` or `<binary_dir>/webui` and mounts it at `/`.
+The CMake build stages the source tree's `webui/` next to the server binary, so a fresh build
++ `./build/moss-tts-server --model …` is enough — opening http://127.0.0.1:8080/ shows the UI.
+
 ### Endpoints
 
 - `GET /health` — readiness probe, returns `ok`.
@@ -274,6 +286,51 @@ response = client.audio.speech.create(
 response.stream_to_file("output.wav")
 ```
 
+## WebUI
+
+A small single-page WebUI ships with the server. It is plain HTML / CSS / vanilla JS — no build
+step, no dependencies — and is mounted at `/` whenever the server can find a `webui/` directory.
+
+Features:
+
+- One-shot **TTS** form (text, optional voice instruction, language hint, max-new-tokens, advanced
+  sampling, optional reference WAV for voice cloning).
+- Per-browser **history** stored in IndexedDB — every successful generation is appended together
+  with its metadata and original WAV blob.
+- In-page **playback**, per-item **download**, **reuse text** (re-populates the form), per-item
+  **delete**, and a **Clear all** button.
+- Live `/info` ping in the header showing model dims, codec status, and requests served.
+
+### Launcher
+
+The provided wrapper finds the server binary and webui directory, then starts the server bound
+to localhost:
+
+```bash
+# Linux / macOS
+scripts/launch-webui.sh weights/moss-tts-q8_0.gguf
+
+# Windows
+scripts\launch-webui.bat weights\moss-tts-q8_0.gguf
+```
+
+Then open <http://127.0.0.1:8080/>.
+
+Override the bound host/port or paths with `MOSS_HOST`, `MOSS_PORT`, `MOSS_SERVER`, `MOSS_WEBUI`,
+or pass any extra `moss-tts-server` flag after the model path (e.g. `--main-gpu 0`,
+`--skip-codec`).
+
+### Running it manually
+
+```bash
+./build/moss-tts-server --model weights/moss-tts-q8_0.gguf --host 0.0.0.0 --port 8080
+# WebUI: http://localhost:8080/
+# API:   http://localhost:8080/tts, /v1/audio/speech, /info, /health
+```
+
+The WebUI directory is plain files under `webui/` — edit `index.html`, `style.css`, or `app.js`
+and refresh the page; no rebuild needed.
+
 ## GPU placement
 
 Both binaries pin the full model — libllama backbone **and** the aux GGML backend (embeddings,
@@ -339,7 +396,9 @@ see [`docs/STATUS.md`](docs/STATUS.md).
 | `src/pipeline.cpp`                    | Prompt builder + autoregressive loop + codec dispatch      |
 | `src/wav.cpp`                         | RIFF/WAVE I/O (no libsndfile dep)                          |
 | `src/cli/moss_tts_cli.cpp`            | CLI entry point                                            |
-| `src/server/moss_tts_server.cpp`      | HTTP server                                                |
+| `src/server/moss_tts_server.cpp`      | HTTP server + static WebUI mount                           |
+| `webui/`                              | Browser WebUI (vanilla HTML / CSS / JS, IndexedDB history) |
+| `scripts/launch-webui.{sh,bat}`       | Server + WebUI launcher                                    |
 | `tests/`                              | Diagnostics: model info, compute-graph smoke, codec round-trip |
 | `third_party/cpp-httplib/httplib.h`   | Vendored single-header HTTP library                        |
 

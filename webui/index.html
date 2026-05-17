@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>openmoss TTS</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◐</span>
+      <span class="title">openmoss <em>TTS</em></span>
+    </div>
+    <div class="status" id="status">connecting…</div>
+  </header>
+
+  <main>
+    <section class="card panel-generate">
+      <h2>Generate</h2>
+
+      <label class="field">
+        <span class="field-label">Text</span>
+        <textarea id="text" rows="5" placeholder="Type the utterance to synthesize…" required></textarea>
+      </label>
+
+      <div class="row">
+        <label class="field">
+          <span class="field-label">Voice instruction <span class="hint">(optional)</span></span>
+          <input id="instruction" type="text" placeholder='e.g. "a calm female voice"' />
+        </label>
+        <label class="field field-narrow">
+          <span class="field-label">Language</span>
+          <select id="language">
+            <option value="">auto</option>
+            <option value="en">English</option>
+            <option value="zh">Chinese</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="row">
+        <label class="field">
+          <span class="field-label">Reference WAV <span class="hint">(voice cloning, optional)</span></span>
+          <input id="reference" type="file" accept="audio/wav,audio/x-wav,audio/*" />
+        </label>
+        <label class="field field-narrow">
+          <span class="field-label">Max new tokens</span>
+          <input id="max_new_tokens" type="number" min="1" max="32768" value="4096" />
+        </label>
+      </div>
+
+      <details class="advanced">
+        <summary>Advanced sampling</summary>
+        <div class="grid">
+          <label class="field"><span class="field-label">text_temperature</span><input id="text_temperature" type="number" step="0.05" /></label>
+          <label class="field"><span class="field-label">text_top_p</span><input id="text_top_p" type="number" step="0.05" min="0" max="1" /></label>
+          <label class="field"><span class="field-label">text_top_k</span><input id="text_top_k" type="number" step="1" min="0" /></label>
+          <label class="field"><span class="field-label">audio_temperature</span><input id="audio_temperature" type="number" step="0.05" /></label>
+          <label class="field"><span class="field-label">audio_top_p</span><input id="audio_top_p" type="number" step="0.05" min="0" max="1" /></label>
+          <label class="field"><span class="field-label">audio_top_k</span><input id="audio_top_k" type="number" step="1" min="0" /></label>
+          <label class="field"><span class="field-label">audio_repetition_penalty</span><input id="audio_repetition_penalty" type="number" step="0.05" /></label>
+          <label class="field"><span class="field-label">seed</span><input id="seed" type="number" step="1" placeholder="random" /></label>
+        </div>
+      </details>
+
+      <div class="actions">
+        <button id="generate" class="primary">Generate</button>
+        <span id="genStatus" class="gen-status"></span>
+      </div>
+    </section>
+
+    <section class="card panel-history">
+      <div class="panel-head">
+        <h2>History</h2>
+        <div class="head-actions">
+          <span id="historyCount" class="hint"></span>
+          <button id="clearAll" class="ghost danger">Clear all</button>
+        </div>
+      </div>
+      <ul id="history" class="history"></ul>
+      <p id="emptyState" class="empty hint" hidden>No generations yet. Your audio history is stored locally in your browser.</p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

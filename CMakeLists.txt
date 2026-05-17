@@ -153,6 +153,16 @@ if(WIN32)
     endforeach()
 endif()
 
+# Make the bundled WebUI available next to the server binary so it auto-detects
+# without --webui-dir. The source tree's webui/ remains the editable copy.
+if(EXISTS "${CMAKE_SOURCE_DIR}/webui/index.html")
+    add_custom_command(TARGET moss-tts-server POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/webui"
+                "$<TARGET_FILE_DIR:moss-tts-server>/webui"
+        COMMENT "Staging WebUI next to moss-tts-server")
+endif()
+
 # ───── Tests ───────────────────────────────────────────────────────────────
 enable_testing()
 add_subdirectory(tests)
