@@ -35,7 +35,11 @@ else()
     set(LLAMA_CPP_BUILD_LIB    "${LLAMA_CPP_BUILD_BIN}")
     set(GGML_BUILD_LIB         "${LLAMA_CPP_BUILD_BIN}")
 
-    set(LLAMA_LIB_SUFFIX       ".so")
+    if(APPLE)
+        set(LLAMA_LIB_SUFFIX   ".dylib")
+    else()
+        set(LLAMA_LIB_SUFFIX   ".so")
+    endif()
     set(LLAMA_IMPLIB_SUFFIX    "")
 endif()
 
@@ -96,6 +100,9 @@ else()
     set(CMAKE_INSTALL_RPATH         "${LLAMA_CPP_BUILD_BIN}")
     set(CMAKE_BUILD_RPATH           "${LLAMA_CPP_BUILD_BIN}")
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+    if(APPLE)
+        set(CMAKE_MACOSX_RPATH ON)
+    endif()
 endif()
 
 # ───── Common library (model + pipeline + codec) ───────────────────────────
