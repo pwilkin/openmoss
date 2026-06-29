@@ -154,8 +154,23 @@ T jget(const json & j, const char * k, const T & dflt) {
     return it->get<T>();
 }
 
-openmoss::SamplingConfig parse_sampling(const json & j) {
+// Per-model default decoding. The struct defaults suit MOSS-TTS (n_vq=32). The
+// reduced-codebook MOSS-VoiceGenerator (n_vq=16) is sensitive to decoding and
+// degenerates (immediate end-of-speech) at those settings; use its documented
+// recommended hyperparameters instead. Callers can still override per request.
+openmoss::SamplingConfig default_sampling(int n_vq) {
     openmoss::SamplingConfig sc;
+    if (n_vq < 32) {
+        sc.audio_temperature        = 1.5f;
+        sc.audio_top_p              = 0.6f;
+        sc.audio_top_k              = 50;
+        sc.audio_repetition_penalty = 1.1f;
+    }
+    return sc;
+}
+
+openmoss::SamplingConfig parse_sampling(const json & j, const openmoss::SamplingConfig & base) {
+    openmoss::SamplingConfig sc = base;
     if (!j.is_object()) return sc;
     sc.text_temperature        = jget(j, "text_temperature",        sc.text_temperature);
     sc.text_top_p              = jget(j, "text_top_p",              sc.text_top_p);
@@ -166,6 +181,29 @@ openmoss::SamplingConfig parse_sampling(const json & j) {
     sc.audio_repetition_penalty = jget(j, "audio_repetition_penalty", sc.audio_repetition_penalty);
     sc.seed                    = jget(j, "seed",                    sc.seed);
     return sc;
+}
+
+// MOSS-VoiceGenerator (n_vq<32) has no reference audio to anchor length: left
+// free it either collapses the segment on the first frame (degenerate immediate
+// end-of-speech) or rambles for minutes. Estimate a length from the text when the
+// caller gave none, then bound the generated segment around it — floor at 3/4
+// (render the text, no early collapse), cap at 3/2 (no ramble) — leaving a
+// natural-ending window in between. No-op for full MOSS-TTS (n_vq>=32), which is
+// anchored by its reference audio.
+void finalize_voicegen_request(openmoss::GenerateRequest & req, const openmoss::ModelDims & dims) {
+    if (dims.n_vq >= 32) return;
+    if (!req.tokens && !req.text.empty()) {
+        // ~12.5 audio tokens/s at ~2.5 words/s -> ~5 tokens/word.
+        int words = 1;
+        for (char c : req.text) if (c == ' ' || c == '\n' || c == '\t') ++words;
+        req.tokens = std::max(40, std::min(1000, words * 5));
+    }
+    if (req.tokens) {
+        if (req.sampling.min_audio_frames == 0)
+            req.sampling.min_audio_frames = std::max(24, req.tokens.value() * 3 / 4);
+        if (req.sampling.max_audio_frames == 0)
+            req.sampling.max_audio_frames = std::max(48, req.tokens.value() * 3 / 2);
+    }
 }
 
 void send_text_error(httplib::Response & rs, int status, const std::string & msg) {
@@ -292,7 +330,9 @@ int main(int argc, char ** argv) {
         if (body.contains("tokens") && body["tokens"].is_number_integer())
             req.tokens      = body["tokens"].get<int>();
         req.max_new_tokens  = jget(body, "max_new_tokens", req.max_new_tokens);
-        req.sampling        = parse_sampling(body.value("sampling", json::object()));
+        req.sampling        = parse_sampling(body.value("sampling", json::object()),
+                                             default_sampling(model->dims().n_vq));
+        finalize_voicegen_request(req, model->dims());
 
         if (body.contains("reference_wav_b64") && body["reference_wav_b64"].is_string()) {
             try {
@@ -392,6 +432,8 @@ int main(int argc, char ** argv) {
         }
         // Scale the default token budget by speed (lower speed = fewer tokens = shorter audio).
         req.max_new_tokens = std::max(1, int(4096 / speed));
+        req.sampling       = default_sampling(model->dims().n_vq);
+        finalize_voicegen_request(req, model->dims());
 
         openmoss::GenerateResult result;
         try {

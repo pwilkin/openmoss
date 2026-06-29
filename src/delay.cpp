@@ -238,6 +238,11 @@ DelayStep DelayState::step(const float * text_logits,
         // Time to close the audio segment with audio_end.
         next_text = m_dims.audio_end_token_id;
         m_is_audio = false;
+    } else if (m_is_audio && m_delayed_length < 0 && sc.max_audio_frames > 0 &&
+               m_audio_length >= int64_t(sc.max_audio_frames)) {
+        // Hit the length cap — force the end-of-segment flush so the model can't
+        // ramble far past the requested length.
+        next_text = m_dims.audio_assistant_delay_slot_token_id;
     } else {
         // Sample text from the (caller-provided, copied) logits buffer.
         // We need a mutable copy to apply masking; the caller owns the original.
@@ -267,6 +272,15 @@ DelayStep DelayState::step(const float * text_logits,
         }
         if (m_step_idx == 0) mask(m_dims.audio_assistant_delay_slot_token_id);
         if (m_step_idx <= n_vq) mask(m_dims.im_end_token_id);
+
+        // Until we've generated a minimum number of frames, forbid the delay slot
+        // (which begins the end-of-segment flush). Without this the model can pick
+        // it on the first audio frame, collapsing the segment to T≈n_vq — which
+        // extract_audio_codes discards as empty (the degenerate immediate EOS).
+        if (m_is_audio && m_delayed_length < 0 &&
+            m_audio_length < int64_t(sc.min_audio_frames)) {
+            mask(m_dims.audio_assistant_delay_slot_token_id);
+        }
 
         next_text = sample_one(tmp.data(), text_vocab_size,
                                sc.text_temperature, sc.text_top_p, sc.text_top_k,
