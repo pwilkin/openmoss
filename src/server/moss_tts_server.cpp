@@ -422,6 +422,19 @@ int main(int argc, char ** argv) {
             req.instruction = body["voice"].get<std::string>();
         }
 
+        // Voice cloning: a base64 WAV reference the model continues in.
+        if (body.contains("reference_wav_b64") && body["reference_wav_b64"].is_string()) {
+            try {
+                auto wav_bytes = b64_decode(body["reference_wav_b64"].get<std::string>());
+                req.reference_wav = openmoss::decode_wav_mono(
+                    wav_bytes.data(), wav_bytes.size(),
+                    model->dims().sampling_rate);
+            } catch (const std::exception & e) {
+                return send_text_error(rs, 400,
+                    std::string("could not decode reference_wav_b64: ") + e.what());
+            }
+        }
+
         // "speed" scales the token budget.  speed=1.0 → default max_new_tokens.
         // We approximate: 1s of audio ≈ 12.5 tokens, and the default model output
         // is roughly 4096 tokens ≈ 328s.  speed just multiplies the budget.
@@ -439,11 +452,12 @@ int main(int argc, char ** argv) {
         try {
             std::lock_guard<std::mutex> g(gen_mu);
             std::fprintf(stderr,
-                "[server] req#%llu /v1/audio/speech input=%zu chars speed=%.2f max=%d\n",
+                "[server] req#%llu /v1/audio/speech input=%zu chars speed=%.2f max=%d ref=%s\n",
                 (unsigned long long)req_id,
                 req.text.size(),
                 speed,
-                req.max_new_tokens);
+                req.max_new_tokens,
+                req.reference_wav ? "yes" : "no");
             result = openmoss::generate(*model, req);
         } catch (const std::exception & e) {
             return send_text_error(rs, 500,
