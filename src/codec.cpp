@@ -77,24 +77,68 @@ struct StageSpec {
                          // stage frame rate × causal_transformer_context_duration (10 s)
 };
 
-constexpr std::array<StageSpec, 4> DECODER_STAGES = {{
-    //   in   d   nh   dff  nl  out  patch  gguf  ctx
+// MOSS-Audio-Tokenizer v1 — 24 kHz mono, hop 1920, 4 transformer stages/side.
+constexpr std::array<StageSpec, 4> DECODER_STAGES_V1 = {{
+    //   in    d   nh   dff  nl  out  patch  gguf  ctx
     {  768, 1280, 20, 5120, 32, 1280,    2,    0,  125 },  // dec.0 @ 12.5 Hz + dec.1 patch
     {  640,  768, 12, 3072, 12,  768,    2,    2,  250 },  // dec.2 @ 25 Hz   + dec.3 patch
     {  384,  768, 12, 3072, 12,  768,    2,    4,  500 },  // dec.4 @ 50 Hz   + dec.5 patch
     {  384,  768, 12, 3072, 12,  240,  240,    6, 1000 },  // dec.6 @ 100 Hz  + dec.7 patch
 }};
 
-// Encoder mirrors the decoder. The initial patch=240 happens BEFORE the first
-// transformer stage; `patch_after` here is the patch that follows the stage.
-constexpr int CODEC_PRE_PATCH = 240;
-constexpr std::array<StageSpec, 4> ENCODER_STAGES = {{
-    //   in   d   nh   dff  nl  out  patch  gguf  ctx
+constexpr std::array<StageSpec, 4> ENCODER_STAGES_V1 = {{
+    //   in    d   nh   dff  nl  out  patch  gguf  ctx
     {  240,  768, 12, 3072, 12,  384,    2,    1, 1000 },  // enc.1 @ 100 Hz  + enc.2 patch
     {  768,  768, 12, 3072, 12,  384,    2,    3,  500 },  // enc.3 @ 50 Hz   + enc.4 patch
     {  768,  768, 12, 3072, 12,  640,    2,    5,  250 },  // enc.5 @ 25 Hz   + enc.6 patch
     { 1280, 1280, 20, 5120, 32,  768,    0,    7,  125 },  // enc.7 @ 12.5 Hz (no patch after)
 }};
+
+// MOSS-Audio-Tokenizer v2 — 48 kHz stereo, hop 3840/channel, 6 stages/side.
+//
+// Same layer math as v1, two more stages per side, and per-stage attention
+// windows instead of a single 10 s one. Upstream computes each window as
+// round(stage_frame_rate × context_duration) where the rate is measured in
+// *interleaved* elements (48000 × 2 channels = 96000 at the waveform end) and
+// context_duration comes from that stage's kwargs — {10,10,8,4,2,1} s from the
+// frame end outwards. The rates below are the interleaved-element rates.
+constexpr std::array<StageSpec, 6> DECODER_STAGES_V2 = {{
+    //   in    d   nh   dff  nl  out  patch  gguf  ctx
+    {  768, 1280, 20, 5120, 32, 1280,    2,    0,  125 },  // dec.0  @ 12.5 Hz × 10 s
+    {  640,  768, 12, 3072, 12,  768,    2,    2,  250 },  // dec.2  @ 25 Hz   × 10 s
+    {  384,  768, 12, 3072, 12,  768,    2,    4,  400 },  // dec.4  @ 50 Hz   ×  8 s
+    {  384,  768, 12, 3072, 12,  768,    2,    6,  400 },  // dec.6  @ 100 Hz  ×  4 s
+    {  384,  768, 12, 3072, 12,  768,    2,    8,  400 },  // dec.8  @ 200 Hz  ×  2 s
+    {  384,  768, 12, 3072, 12,  240,  240,   10,  400 },  // dec.10 @ 400 Hz  ×  1 s
+}};
+
+constexpr std::array<StageSpec, 6> ENCODER_STAGES_V2 = {{
+    //   in    d   nh   dff  nl  out  patch  gguf  ctx
+    {  240,  768, 12, 3072, 12,  384,    2,    1,  400 },  // enc.1  @ 400 Hz  ×  1 s
+    {  768,  768, 12, 3072, 12,  384,    2,    3,  400 },  // enc.3  @ 200 Hz  ×  2 s
+    {  768,  768, 12, 3072, 12,  384,    2,    5,  400 },  // enc.5  @ 100 Hz  ×  4 s
+    {  768,  768, 12, 3072, 12,  384,    2,    7,  400 },  // enc.7  @ 50 Hz   ×  8 s
+    {  768,  768, 12, 3072, 12,  640,    2,    9,  250 },  // enc.9  @ 25 Hz   × 10 s
+    { 1280, 1280, 20, 5120, 32,  768,    0,   11,  125 },  // enc.11 @ 12.5 Hz × 10 s
+}};
+
+// The initial patch=240 happens BEFORE the first encoder transformer stage;
+// `patch_after` is the patch that follows a stage. Same in both generations.
+constexpr int CODEC_PRE_PATCH = 240;
+
+std::vector<StageSpec> stages_for(int codec_version, bool decoder) {
+    switch (codec_version) {
+        case 1: return decoder
+            ? std::vector<StageSpec>(DECODER_STAGES_V1.begin(), DECODER_STAGES_V1.end())
+            : std::vector<StageSpec>(ENCODER_STAGES_V1.begin(), ENCODER_STAGES_V1.end());
+        case 2: return decoder
+            ? std::vector<StageSpec>(DECODER_STAGES_V2.begin(), DECODER_STAGES_V2.end())
+            : std::vector<StageSpec>(ENCODER_STAGES_V2.begin(), ENCODER_STAGES_V2.end());
+        default:
+            throw std::runtime_error("unsupported moss.codec.version: "
+                                     + std::to_string(codec_version));
+    }
+}
 
 // f16 representation helpers (we store everything as f16 on the backend).
 inline uint16_t f32_to_f16_bits(float f) {
@@ -210,8 +254,10 @@ private:
         ggml_tensor        * oproj = nullptr;   // optional (null when d_model == output_dim)
         std::vector<Layer>   layers;
     };
-    std::array<Stage, 4> m_stages;     // decoder stages (dec.0/2/4/6)
-    std::array<Stage, 4> m_enc_stages; // encoder stages (enc.1/3/5/7)
+    // Sized from moss.codec.version at construction: 4 stages/side for v1,
+    // 6 for v2.
+    std::vector<Stage> m_stages;      // decoder stages (dec.0/2/4/… )
+    std::vector<Stage> m_enc_stages;  // encoder stages (enc.1/3/5/… )
 
     ggml_gallocr_t m_galloc = nullptr;
 
@@ -220,6 +266,7 @@ private:
     ggml_tensor * tensor_or_null_(const std::string & name) const;
     void resolve_decoder_();
     void resolve_encoder_();
+    void validate_stage_(const Stage & S, const char * side) const;
     void compute_effective_weights_();
     void compute_normalized_codebooks_();
     ggml_tensor * read_f16_to_host_(ggml_tensor * t, std::vector<uint16_t> & out) const;
@@ -227,20 +274,43 @@ private:
     // Graph construction:
     ggml_tensor * build_layer_norm_(ggml_context * gctx, ggml_tensor * x,
                                     ggml_tensor * w, ggml_tensor * b) const;
+    // How one stage's attention is carved up over the time axis.
+    //
+    // Every stage is banded: query q attends only to keys in (q - context, q].
+    // A dense (T, T) mask therefore wastes ~98% of its entries on -inf, and at
+    // v2's deepest decoder stage — 32x the frame rate — the masks across all
+    // stages come to ~2730 * T_audio^2 bytes: 384 MiB at 30 s, 1.5 GiB at 60 s,
+    // in host RAM *and* backend memory.
+    //
+    // Instead, split the queries into chunks and give each chunk a mask over
+    // only the keys it can reach: [q0 - context + 1, q1). Memory falls to
+    // ~T * (chunk + context), and the attention FLOPs drop from O(T^2) to
+    // O(T * context). One block covering everything reproduces the old
+    // behaviour exactly, which is what short stages get.
+    struct AttnPlan {
+        struct Block {
+            int64_t q0 = 0, q1 = 0;   // query range
+            int64_t k0 = 0;           // first reachable key
+            ggml_tensor * mask = nullptr;   // (n_kv, n_q) f16
+        };
+        int64_t T = 0;
+        int64_t context = 0;
+        std::vector<Block> blocks;
+    };
+
     ggml_tensor * build_attention_(ggml_context * gctx, ggml_tensor * x,
                                     const Layer & L, int d_model, int n_heads,
-                                    ggml_tensor * pos, ggml_tensor * mask) const;
+                                    ggml_tensor * pos, const AttnPlan & plan) const;
     ggml_tensor * build_ffn_(ggml_context * gctx, ggml_tensor * x,
                               const Layer & L) const;
     ggml_tensor * build_layer_(ggml_context * gctx, ggml_tensor * x,
                                 const Layer & L, int d_model, int n_heads,
-                                ggml_tensor * pos, ggml_tensor * mask) const;
+                                ggml_tensor * pos, const AttnPlan & plan) const;
     ggml_tensor * build_stage_(ggml_context * gctx, ggml_tensor * x,
                                 const Stage & S, ggml_tensor * pos,
-                                ggml_tensor * mask) const;
-    // Build an (T, T) f16 causal mask input tensor for flash attention.
-    static ggml_tensor * make_causal_mask_(ggml_context * gctx, int64_t T);
-    static void fill_causal_mask_(ggml_tensor * mask, int64_t context);
+                                const AttnPlan & plan) const;
+    static AttnPlan make_attn_plan_(ggml_context * gctx, int64_t T, int64_t context);
+    static void     fill_attn_plan_(const AttnPlan & plan);
     static ggml_tensor * patch_upsample_(ggml_context * gctx,
                                           ggml_tensor * x, int patch);
     static ggml_tensor * patch_downsample_(ggml_context * gctx,
@@ -300,16 +370,21 @@ void CodecGraphs::resolve_decoder_() {
     }
 
     // decoder stages
+    const auto specs = stages_for(m_owner.dims().codec_version, /*decoder=*/true);
+    m_stages.resize(specs.size());
     for (size_t s = 0; s < m_stages.size(); ++s) {
         Stage & S = m_stages[s];
-        S.spec = DECODER_STAGES[s];
+        S.spec = specs[s];
         const std::string base = "moss.codec.dec." + std::to_string(S.spec.gguf_idx) + ".";
 
-        // Optional input/output projections (Identity in PyTorch when dim matches).
-        S.iproj = (S.spec.d_model != S.spec.input_dim)
-            ? tensor_(base + "iproj.weight") : nullptr;
-        S.oproj = (S.spec.d_model != S.spec.output_dim)
-            ? tensor_(base + "oproj.weight") : nullptr;
+        // Look these up unconditionally rather than inferring their existence
+        // from the dimensions. v1 used nn.Identity() when d_model matched, so
+        // the tensors genuinely are absent there; v2 always materialises an
+        // nn.Linear, including ten *square* learned projections. Keying off
+        // `d_model != input_dim` would skip those silently and produce subtly
+        // wrong audio instead of a load error.
+        S.iproj = tensor_or_null_(base + "iproj.weight");
+        S.oproj = tensor_or_null_(base + "oproj.weight");
 
         S.layers.resize(size_t(S.spec.n_layers));
         for (int li = 0; li < S.spec.n_layers; ++li) {
@@ -326,20 +401,21 @@ void CodecGraphs::resolve_decoder_() {
             L.layer_scale_1 = tensor_(lb + "layer_scale_1.scale");
             L.layer_scale_2 = tensor_(lb + "layer_scale_2.scale");
         }
+        validate_stage_(S, "dec");
     }
 }
 
 // Resolve encoder weights (mirror of resolve_decoder_).
 void CodecGraphs::resolve_encoder_() {
+    const auto specs = stages_for(m_owner.dims().codec_version, /*decoder=*/false);
+    m_enc_stages.resize(specs.size());
     for (size_t s = 0; s < m_enc_stages.size(); ++s) {
         Stage & S = m_enc_stages[s];
-        S.spec = ENCODER_STAGES[s];
+        S.spec = specs[s];
         const std::string base = "moss.codec.enc." + std::to_string(S.spec.gguf_idx) + ".";
 
-        S.iproj = (S.spec.d_model != S.spec.input_dim)
-            ? tensor_(base + "iproj.weight") : nullptr;
-        S.oproj = (S.spec.d_model != S.spec.output_dim)
-            ? tensor_(base + "oproj.weight") : nullptr;
+        S.iproj = tensor_or_null_(base + "iproj.weight");   // see resolve_decoder_
+        S.oproj = tensor_or_null_(base + "oproj.weight");
 
         S.layers.resize(size_t(S.spec.n_layers));
         for (int li = 0; li < S.spec.n_layers; ++li) {
@@ -356,7 +432,39 @@ void CodecGraphs::resolve_encoder_() {
             L.layer_scale_1 = tensor_(lb + "layer_scale_1.scale");
             L.layer_scale_2 = tensor_(lb + "layer_scale_2.scale");
         }
+        validate_stage_(S, "enc");
     }
+}
+
+// A stage projection may legitimately be absent only when it would have been an
+// nn.Identity() upstream — i.e. when the dimensions it maps between are equal.
+// Anything else means the sidecar is missing a learned matrix, which would
+// otherwise degrade the audio silently rather than failing. Shapes are checked
+// too, since GGUF carries no type information beyond the name.
+void CodecGraphs::validate_stage_(const Stage & S, const char * side) const {
+    const std::string where = std::string(side) + "." + std::to_string(S.spec.gguf_idx);
+
+    auto check = [&](ggml_tensor * t, const char * what, int in_dim, int out_dim) {
+        if (!t) {
+            if (in_dim != out_dim) {
+                throw std::runtime_error(
+                    "CodecGraphs: " + where + "." + what + " is missing from the sidecar, "
+                    "but it maps " + std::to_string(in_dim) + " → " + std::to_string(out_dim)
+                    + " so it cannot be an identity. Reconvert the model.");
+            }
+            return;   // genuinely nn.Identity() upstream
+        }
+        if (t->ne[0] != in_dim || t->ne[1] != out_dim) {
+            throw std::runtime_error(
+                "CodecGraphs: " + where + "." + what + " has shape ("
+                + std::to_string(t->ne[0]) + ", " + std::to_string(t->ne[1])
+                + "), expected (" + std::to_string(in_dim) + ", "
+                + std::to_string(out_dim) + ")");
+        }
+    };
+
+    check(S.iproj, "iproj", S.spec.input_dim, S.spec.d_model);
+    check(S.oproj, "oproj", S.spec.d_model,   S.spec.output_dim);
 }
 
 // Read a backend tensor (f16) into a host f16 buffer. Returns the tensor
@@ -588,7 +696,7 @@ ggml_tensor * CodecGraphs::build_attention_(ggml_context * gctx,
                                              int d_model,
                                              int n_heads,
                                              ggml_tensor * pos,
-                                             ggml_tensor * mask) const {
+                                             const AttnPlan & plan) const {
     const int head_dim = d_model / n_heads;
     const int T        = int(x->ne[1]);
 
@@ -638,11 +746,39 @@ ggml_tensor * CodecGraphs::build_attention_(ggml_context * gctx,
     ggml_tensor * Kh = ggml_cast(gctx, Kp, GGML_TYPE_F16);
     ggml_tensor * Vh = ggml_cast(gctx, Vp, GGML_TYPE_F16);
 
-    ggml_tensor * attn = ggml_flash_attn_ext(gctx, Qp, Kh, Vh, mask,
-                                             1.0f / std::sqrt(float(head_dim)),
-                                             /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
-    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
-    // result: (head_dim, n_heads, T) contiguous → flatten heads into d_model.
+    const float scale = 1.0f / std::sqrt(float(head_dim));
+
+    // One flash-attention call per query chunk, each seeing only the keys its
+    // queries can actually reach. Results concatenate along the time axis.
+    ggml_tensor * attn = nullptr;
+    for (const auto & b : plan.blocks) {
+        const int64_t n_q  = b.q1 - b.q0;
+        const int64_t n_kv = b.q1 - b.k0;
+
+        ggml_tensor * q = Qp;
+        ggml_tensor * k = Kh;
+        ggml_tensor * v = Vh;
+        if (n_q != T) {
+            q = ggml_cont(gctx, ggml_view_3d(gctx, Qp, head_dim, n_q, n_heads,
+                                             Qp->nb[1], Qp->nb[2],
+                                             size_t(b.q0) * Qp->nb[1]));
+        }
+        if (n_kv != T) {
+            k = ggml_cont(gctx, ggml_view_3d(gctx, Kh, head_dim, n_kv, n_heads,
+                                             Kh->nb[1], Kh->nb[2],
+                                             size_t(b.k0) * Kh->nb[1]));
+            v = ggml_cont(gctx, ggml_view_3d(gctx, Vh, head_dim, n_kv, n_heads,
+                                             Vh->nb[1], Vh->nb[2],
+                                             size_t(b.k0) * Vh->nb[1]));
+        }
+
+        ggml_tensor * a = ggml_flash_attn_ext(gctx, q, k, v, b.mask, scale,
+                                              /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
+        ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32);
+        // (head_dim, n_heads, n_q)
+        attn = attn ? ggml_concat(gctx, attn, a, 2) : a;
+    }
+    // → flatten heads into d_model.
     attn = ggml_reshape_2d(gctx, attn, d_model, T);
 
     // output projection
@@ -665,10 +801,10 @@ ggml_tensor * CodecGraphs::build_layer_(ggml_context * gctx,
                                          int d_model,
                                          int n_heads,
                                          ggml_tensor * pos,
-                                         ggml_tensor * mask) const {
+                                         const AttnPlan & plan) const {
     // attn block
     ggml_tensor * y = build_layer_norm_(gctx, x, L.norm1_w, L.norm1_b);
-    y = build_attention_(gctx, y, L, d_model, n_heads, pos, mask);
+    y = build_attention_(gctx, y, L, d_model, n_heads, pos, plan);
     y = ggml_mul(gctx, y, to_f32_(gctx, L.layer_scale_1));
     x = ggml_add(gctx, x, y);
 
@@ -686,43 +822,69 @@ ggml_tensor * CodecGraphs::build_stage_(ggml_context * gctx,
                                          ggml_tensor * x,
                                          const Stage & S,
                                          ggml_tensor * pos,
-                                         ggml_tensor * mask) const {
+                                         const AttnPlan & plan) const {
     if (S.iproj) x = ggml_mul_mat(gctx, S.iproj, x);
     for (const Layer & L : S.layers) {
-        x = build_layer_(gctx, x, L, S.spec.d_model, S.spec.n_heads, pos, mask);
+        x = build_layer_(gctx, x, L, S.spec.d_model, S.spec.n_heads, pos, plan);
     }
     if (S.oproj) x = ggml_mul_mat(gctx, S.oproj, x);
     return x;
 }
 
-// Causal mask for flash attention: (T, T) f16, mask[kv, q] = 0 if kv <= q else
-// -inf (lower-triangular). ne[0]=n_kv is the inner/contiguous dim. Created as a
-// graph input and filled after allocation (see decode/encode).
-ggml_tensor * CodecGraphs::make_causal_mask_(ggml_context * gctx, int64_t T) {
-    ggml_tensor * m = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, T, T);
-    ggml_set_input(m);
-    return m;
+// Chunk width, in queries. Bigger chunks mean fewer flash-attention calls but a
+// wider mask per chunk (memory ~ T * (chunk + context)). 1024 keeps both small:
+// at T = 16000 and context = 400 the masks total ~46 MiB instead of ~512 MiB.
+static constexpr int64_t ATTN_CHUNK = 1024;
+
+CodecGraphs::AttnPlan CodecGraphs::make_attn_plan_(ggml_context * gctx,
+                                                   int64_t T, int64_t context) {
+    AttnPlan plan;
+    plan.T       = T;
+    plan.context = context;
+    if (T <= 0) return plan;
+
+    // Short stages stay in one block, which is bit-for-bit the previous
+    // behaviour: a single (T, T) mask and one flash-attention call.
+    const int64_t chunk = (T <= ATTN_CHUNK) ? T : ATTN_CHUNK;
+
+    for (int64_t q0 = 0; q0 < T; q0 += chunk) {
+        AttnPlan::Block b;
+        b.q0 = q0;
+        b.q1 = std::min(q0 + chunk, T);
+        // Query q reaches back to q - context + 1; the earliest query in this
+        // block therefore bounds the key window.
+        b.k0 = (context > 0) ? std::max<int64_t>(0, q0 - context + 1) : 0;
+        b.mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, b.q1 - b.k0, b.q1 - b.q0);
+        ggml_set_input(b.mask);
+        plan.blocks.push_back(b);
+    }
+    return plan;
 }
 
 // The codec transformers are trained with a *sliding-window* causal mask
-// (config `causal_transformer_context_duration` = 10 s → per-stage window of
-// frame_rate × 10 keys; upstream: `attn_bias = (delta >= 0) & (delta <
-// context)`). Attending past that window feeds the model RoPE distances it
-// never saw in training and audio quality collapses progressively after the
-// 10 s mark (issue #7), so the band limit is not an optimisation — it is part
-// of the model.
-void CodecGraphs::fill_causal_mask_(ggml_tensor * mask, int64_t context) {
-    const int64_t T = mask->ne[0];
-    static const uint16_t F16_ZERO = 0x0000;
+// (per-stage `context_duration` x the stage's frame rate; upstream:
+// `attn_bias = (delta >= 0) & (delta < context)`). Attending past that window
+// feeds the model RoPE distances it never saw in training and audio quality
+// collapses progressively past the window (issue #7), so the band limit is not
+// an optimisation — it is part of the model.
+void CodecGraphs::fill_attn_plan_(const AttnPlan & plan) {
+    static const uint16_t F16_ZERO    = 0x0000;
     static const uint16_t F16_NEG_INF = 0xFC00;
-    std::vector<uint16_t> buf(size_t(T) * size_t(T));
-    for (int64_t q = 0; q < T; ++q) {
-        uint16_t * row = buf.data() + size_t(q) * size_t(T);
-        for (int64_t kv = 0; kv < T; ++kv) {
-            row[kv] = (kv <= q && q - kv < context) ? F16_ZERO : F16_NEG_INF;
+    std::vector<uint16_t> buf;
+    for (const auto & b : plan.blocks) {
+        const int64_t n_kv = b.q1 - b.k0;
+        const int64_t n_q  = b.q1 - b.q0;
+        buf.assign(size_t(n_kv) * size_t(n_q), F16_NEG_INF);
+        for (int64_t qi = 0; qi < n_q; ++qi) {
+            const int64_t q = b.q0 + qi;
+            uint16_t * row = buf.data() + size_t(qi) * size_t(n_kv);
+            // Global key k is visible iff k <= q and q - k < context.
+            const int64_t lo = (plan.context > 0)
+                             ? std::max(b.k0, q - plan.context + 1) : b.k0;
+            for (int64_t k = lo; k <= q; ++k) row[k - b.k0] = F16_ZERO;
         }
+        ggml_backend_tensor_set(b.mask, buf.data(), 0, buf.size() * sizeof(uint16_t));
     }
-    ggml_backend_tensor_set(mask, buf.data(), 0, buf.size() * sizeof(uint16_t));
 }
 
 // PyTorch:  x.reshape(b, d, h, l).permute(0, 1, 3, 2).reshape(b, d, l*h)
@@ -799,27 +961,42 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
     if (T_audio <= 0) return {};
 
     // Flash attention streams the softmax, so there's no O(T²) scores buffer
-    // anymore — but each stage still needs an (T×T) f16 causal mask, and the
-    // last stage runs at 8·T_audio. A runaway generation (model never emits an
-    // end-of-speech token) could ask for thousands of frames, whose mask alone
-    // would balloon to many GB. Refuse early with an actionable message instead
-    // of attempting a doomed allocation.
+    // anymore — but each stage still needs an (T×T) f16 causal mask, and T grows
+    // by the patch factor at every stage. Sum over all of them: for v2 the last
+    // decoder stage runs at 32·T_audio, so the masks total ≈ 2730·T_audio² bytes
+    // (384 MiB at 30 s, 1.5 GiB at 60 s). A runaway generation — the model never
+    // emitting an end-of-speech token — would balloon this to many GB, so refuse
+    // early with an actionable message instead of attempting a doomed allocation.
     {
-        const int64_t T_last     = int64_t(T_audio) * 8;             // last decoder stage
-        const int64_t mask_bytes = T_last * T_last * int64_t(sizeof(uint16_t)); // f16 causal mask
-        const int64_t cap_bytes  = int64_t(8) * 1024 * 1024 * 1024;  // ~8 GiB
+        int64_t T = T_audio;
+        int64_t mask_bytes = 0;
+        for (const auto & S : m_stages) {
+            // Chunked plan: ceil(T/chunk) blocks, each (chunk + context) x chunk.
+            const int64_t chunk = std::min<int64_t>(T, 1024);
+            if (chunk > 0) {
+                const int64_t nblk = (T + chunk - 1) / chunk;
+                mask_bytes += nblk * (chunk + S.spec.context) * chunk
+                            * int64_t(sizeof(uint16_t));
+            }
+            if (S.spec.patch_after > 0) T *= S.spec.patch_after;
+        }
+        const int64_t cap_bytes = int64_t(8) * 1024 * 1024 * 1024;  // ~8 GiB
         if (mask_bytes > cap_bytes) {
-            const double secs = T_audio * 1920.0 / 24000.0;
+            const double secs = double(T_audio) * double(m_owner.dims().downsample_rate)
+                              / double(m_owner.dims().sampling_rate);
             throw std::runtime_error(
                 "CodecGraphs::decode: refusing to decode " + std::to_string(T_audio) +
                 " frames (~" + std::to_string(int(secs)) + "s): the codec attention "
-                "mask alone would need ~" + std::to_string(mask_bytes >> 30) +
+                "masks alone would need ~" + std::to_string(mask_bytes >> 30) +
                 " GiB. This usually means generation never emitted an end-of-speech "
                 "token (try a lower --max-new-tokens / different sampling).");
         }
     }
 
-    const int n_samples = T_audio * 1920;
+    // Samples the final unpatch emits, across all channels. Stereo is carried as
+    // L/R time-interleaving through a 1-channel network, so this buffer is
+    // already in interleaved order — exactly what a WAV writer wants.
+    const int64_t n_samples = int64_t(T_audio) * m_owner.dims().samples_per_frame();
 
     // ── Build graph ────────────────────────────────────────────────────────
     ggml_init_params ip{};
@@ -839,20 +1016,18 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
         ggml_set_input(codes_in[i]);
     }
 
-    // Per-stage RoPE position tensors. Each stage operates at a different T.
-    int T_at[4];
-    T_at[0] = T_audio;
-    T_at[1] = T_at[0] * DECODER_STAGES[0].patch_after;
-    T_at[2] = T_at[1] * DECODER_STAGES[1].patch_after;
-    T_at[3] = T_at[2] * DECODER_STAGES[2].patch_after;
-    std::array<ggml_tensor *, 4> pos_T {};
-    std::array<ggml_tensor *, 4> mask_T {};
-    for (int s = 0; s < 4; ++s) {
+    // Per-stage RoPE position tensors. Each stage operates at a different T,
+    // growing by the previous stage's patch factor.
+    const size_t n_stages = m_stages.size();
+    std::vector<int>           T_at(n_stages);
+    std::vector<ggml_tensor *> pos_T(n_stages, nullptr);
+    std::vector<AttnPlan> plan_T(n_stages);
+    for (size_t s = 0; s < n_stages; ++s) {
+        T_at[s] = (s == 0) ? T_audio : T_at[s - 1] * m_stages[s - 1].spec.patch_after;
         pos_T[s] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T_at[s]);
         ggml_set_name(pos_T[s], ("pos_" + std::to_string(s)).c_str());
         ggml_set_input(pos_T[s]);
-        mask_T[s] = make_causal_mask_(gctx, T_at[s]);
-        ggml_set_name(mask_T[s], ("mask_" + std::to_string(s)).c_str());
+        plan_T[s] = make_attn_plan_(gctx, T_at[s], m_stages[s].spec.context);
     }
 
     // ── Quantizer.decode_codes ─────────────────────────────────────────────
@@ -869,15 +1044,16 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
     ggml_tensor * x = ggml_mul_mat(gctx, m_quant_oproj_w, sum);     // (768, T) f32
     x = ggml_add(gctx, x, to_f32_(gctx, m_quant_oproj_b));          // (768, T)
 
-    // ── 4 transformer stages, each followed by a patch upsample ───────────
-    for (int s = 0; s < 4; ++s) {
-        x = build_stage_(gctx, x, m_stages[s], pos_T[s], mask_T[s]);
+    // Transformer stages, each followed by a patch upsample.
+    for (size_t s = 0; s < n_stages; ++s) {
+        x = build_stage_(gctx, x, m_stages[s], pos_T[s], plan_T[s]);
         if (m_stages[s].spec.patch_after > 0) {
             x = patch_upsample_(gctx, x, m_stages[s].spec.patch_after);
         }
     }
 
-    // After dec.7 the channel dim is 1 and time is T_audio*1920. View as 1D.
+    // After the final unpatch the channel dim is 1 and time is n_samples.
+    // View as 1D.
     ggml_tensor * waveform = ggml_reshape_1d(gctx, x, n_samples);
     ggml_set_name(waveform, "waveform");
     ggml_set_output(waveform);
@@ -897,13 +1073,13 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
         ggml_backend_tensor_set(codes_in[i], col.data(), 0,
                                 size_t(T_audio) * sizeof(int32_t));
     }
-    for (int s = 0; s < 4; ++s) {
+    for (size_t s = 0; s < n_stages; ++s) {
         std::vector<int32_t> p;
         p.resize(size_t(T_at[s]));
         for (int t = 0; t < T_at[s]; ++t) p[size_t(t)] = t;
         ggml_backend_tensor_set(pos_T[s], p.data(), 0,
                                 p.size() * sizeof(int32_t));
-        fill_causal_mask_(mask_T[s], DECODER_STAGES[s].context);
+        fill_attn_plan_(plan_T[s]);
     }
 
     if (ggml_backend_graph_compute(aux->backend, graph) != GGML_STATUS_SUCCESS) {
@@ -935,9 +1111,20 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
     }
     if (n_samples <= 0) { T_audio_out = 0; return {}; }
 
-    // Pad waveform to a multiple of downsample_rate (1920) — same convention
-    // as MossAudioTokenizerModel._encode_frame.
-    const int64_t hop = 1920;
+    // Encode only as many codebooks as the *model* consumes. RVQ is greedy —
+    // code i depends solely on the residual left by codes 0..i-1 — so the first
+    // n_vq codes are bit-identical whether or not the deeper ones are computed.
+    // MOSS-TTS-Delay wants all 32; MOSS-TTS-Local wants 12.
+    const int n_vq = std::min(m_owner.dims().n_vq, CODEC_NUM_VQ);
+    if (n_vq < 1) {
+        throw std::runtime_error("CodecGraphs::encode: model reports n_vq=" +
+                                 std::to_string(m_owner.dims().n_vq));
+    }
+
+    // Pad the waveform to a whole number of codec frames — same convention as
+    // MossAudioTokenizerModel._encode_frame. `waveform` is interleaved across
+    // channels, so the hop is measured in interleaved elements too.
+    const int64_t hop = m_owner.dims().samples_per_frame();
     int64_t T_wav = n_samples;
     int64_t pad = (hop - (T_wav % hop)) % hop;
     int64_t T_padded = T_wav + pad;
@@ -957,28 +1144,27 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
     ggml_set_name(wav, "waveform");
     ggml_set_input(wav);
 
-    // Per-stage RoPE positions, one per encoder transformer stage.
-    int T_at[4];
-    T_at[0] = int(T_padded / CODEC_PRE_PATCH);                       // input to enc.1
-    T_at[1] = T_at[0] / ENCODER_STAGES[0].patch_after;               // input to enc.3
-    T_at[2] = T_at[1] / ENCODER_STAGES[1].patch_after;               // input to enc.5
-    T_at[3] = T_at[2] / ENCODER_STAGES[2].patch_after;               // input to enc.7
-    std::array<ggml_tensor *, 4> pos_T {};
-    std::array<ggml_tensor *, 4> mask_T {};
-    for (int s = 0; s < 4; ++s) {
+    // Per-stage RoPE positions, one per encoder transformer stage. T shrinks by
+    // the previous stage's patch factor.
+    const size_t n_stages = m_enc_stages.size();
+    std::vector<int>           T_at(n_stages);
+    std::vector<ggml_tensor *> pos_T(n_stages, nullptr);
+    std::vector<AttnPlan> plan_T(n_stages);
+    for (size_t s = 0; s < n_stages; ++s) {
+        T_at[s] = (s == 0) ? int(T_padded / CODEC_PRE_PATCH)
+                           : T_at[s - 1] / m_enc_stages[s - 1].spec.patch_after;
         pos_T[s] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T_at[s]);
         ggml_set_name(pos_T[s], ("enc_pos_" + std::to_string(s)).c_str());
         ggml_set_input(pos_T[s]);
-        mask_T[s] = make_causal_mask_(gctx, T_at[s]);
-        ggml_set_name(mask_T[s], ("enc_mask_" + std::to_string(s)).c_str());
+        plan_T[s] = make_attn_plan_(gctx, T_at[s], m_enc_stages[s].spec.context);
     }
 
     // Initial patch=240 downsample: (1, T_padded) → (240, T_padded/240)
     ggml_tensor * x = patch_downsample_(gctx, wav, CODEC_PRE_PATCH);
 
-    // Four encoder stages, each followed by a patch downsample (except the last).
-    for (int s = 0; s < 4; ++s) {
-        x = build_stage_(gctx, x, m_enc_stages[s], pos_T[s], mask_T[s]);
+    // Encoder stages, each followed by a patch downsample (except the last).
+    for (size_t s = 0; s < n_stages; ++s) {
+        x = build_stage_(gctx, x, m_enc_stages[s], pos_T[s], plan_T[s]);
         if (m_enc_stages[s].spec.patch_after > 0) {
             x = patch_downsample_(gctx, x, m_enc_stages[s].spec.patch_after);
         }
@@ -990,7 +1176,7 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
     residual = ggml_add(gctx, residual, to_f32_(gctx, m_quant_iproj_b));      // (512, T)
 
     std::array<ggml_tensor *, CODEC_NUM_VQ> indices {};
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    for (int i = 0; i < n_vq; ++i) {
         // z_e = q[i].iproj(residual)
         ggml_tensor * z_e = ggml_mul_mat(gctx, m_q_iproj_w[i], residual);     // (8, T)
         z_e = ggml_add(gctx, z_e, to_f32_(gctx, m_q_iproj_b[i]));             // (8, T)
@@ -1018,7 +1204,7 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
     }
 
     ggml_cgraph * graph = ggml_new_graph_custom(gctx, 65536, false);
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) ggml_build_forward_expand(graph, indices[i]);
+    for (int i = 0; i < n_vq; ++i) ggml_build_forward_expand(graph, indices[i]);
 
     if (!ggml_gallocr_alloc_graph(m_galloc, graph)) {
         ggml_free(gctx);
@@ -1032,12 +1218,12 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
         std::memcpy(wpad.data(), waveform, size_t(T_wav) * sizeof(float));
         ggml_backend_tensor_set(wav, wpad.data(), 0, wpad.size() * sizeof(float));
     }
-    for (int s = 0; s < 4; ++s) {
+    for (size_t s = 0; s < n_stages; ++s) {
         std::vector<int32_t> p;
         p.resize(size_t(T_at[s]));
         for (int t = 0; t < T_at[s]; ++t) p[size_t(t)] = t;
         ggml_backend_tensor_set(pos_T[s], p.data(), 0, p.size() * sizeof(int32_t));
-        fill_causal_mask_(mask_T[s], ENCODER_STAGES[s].context);
+        fill_attn_plan_(plan_T[s]);
     }
 
     if (ggml_backend_graph_compute(aux->backend, graph) != GGML_STATUS_SUCCESS) {
@@ -1047,8 +1233,8 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
 
     // ── Read indices back: assemble (n_vq, T_audio) row-major i32 ─────────
     std::vector<int32_t> out;
-    out.assign(size_t(CODEC_NUM_VQ) * size_t(T_audio), 0);
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    out.assign(size_t(n_vq) * size_t(T_audio), 0);
+    for (int i = 0; i < n_vq; ++i) {
         ggml_backend_tensor_get(indices[i], out.data() + size_t(i) * size_t(T_audio),
                                 0, size_t(T_audio) * sizeof(int32_t));
     }
@@ -1081,7 +1267,7 @@ std::vector<int32_t> codec_encode(Model & model,
                                    int64_t       n_samples,
                                    int32_t &     n_vq_out,
                                    int32_t &     t_audio_out) {
-    n_vq_out = CODEC_NUM_VQ;
+    n_vq_out = std::min(model.dims().n_vq, CODEC_NUM_VQ);
     CodecGraphs * cg = model.codec();
     if (!cg) throw std::runtime_error("codec_encode: codec not available on this model");
     return cg->encode(waveform, n_samples, t_audio_out);
