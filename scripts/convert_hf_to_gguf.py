@@ -16,6 +16,13 @@ with ``--arch``):
                      1-layer local ("depth") transformer, MOSS-Audio-Tokenizer
                      v2 (48 kHz stereo).
 
+    moss_soundeffect MOSS-SoundEffect-v2.0
+                     Not autoregressive at all: a 30-block Wan-style Diffusion
+                     Transformer sampled with flow matching, conditioned on a
+                     Qwen3-1.7B text encoder, decoded by a continuous DAC KL-VAE
+                     (48 kHz mono). Detected from model_index.json rather than
+                     config.json, since it ships as a diffusers pipeline.
+
 Layout produced
 ---------------
 The output GGUF is a *valid Qwen3 GGUF for libllama* (so the backbone loads via
@@ -407,6 +414,29 @@ def extract_qwen3_backbone(moss_dir: Path, out_dir: Path,
             shutil.copy2(src, out_dir / fn)
 
 
+def assemble_backbone_dir(moss_dir: Path, out_dir: Path, fam: "Family") -> None:
+    """For families whose backbone already *is* a standalone HF checkpoint in a
+    subdirectory, just place it next to the tokenizer files.
+
+    MOSS-SoundEffect keeps its Qwen3-1.7B text encoder in text_encoder/ with the
+    tokenizer in a sibling tokenizer/ dir; llama.cpp's converter wants them in
+    one directory.
+    """
+    src = moss_dir / fam.backbone_subdir
+    if not (src / "config.json").exists():
+        raise RuntimeError(f"{fam.arch}: no config.json in {src}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for f in src.iterdir():
+        if f.is_file():
+            shutil.copy2(f, out_dir / f.name)
+    tok = moss_dir / "tokenizer"
+    if tok.is_dir():
+        for f in tok.iterdir():
+            if f.is_file():
+                shutil.copy2(f, out_dir / f.name)
+    log.info("  assembled backbone dir from %s + %s", src.name, tok.name)
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Stage 2: invoke llama.cpp's converter on the prepared Qwen3 dir
 # ────────────────────────────────────────────────────────────────────────────
@@ -599,12 +629,164 @@ def collect_codec_tensors(codec_dir: Path):
                 yield short, arr
 
 
+def _fold_weight_norm(g: "np.ndarray", v: "np.ndarray") -> "np.ndarray":
+    """PyTorch weight_norm reconstruction: w = g * v / ||v||.
+
+    The norm runs over every dim except dim 0, and *dim 0 means different
+    things for the two conv flavours*:
+
+        Conv1d          weight is [out, in, k]  -> g is indexed by OUT channel
+        ConvTranspose1d weight is [in, out, k]  -> g is indexed by IN  channel
+
+    Both are handled identically here precisely because both put the indexed
+    axis first; the caller does not need to care which it has.
+    """
+    v = v.astype(np.float32, copy=False)
+    norm = np.sqrt((v.astype(np.float64) ** 2).sum(axis=tuple(range(1, v.ndim)),
+                                                   keepdims=True))
+    return (g.astype(np.float64) * v.astype(np.float64) / norm).astype(np.float32)
+
+
+def collect_soundeffect_extras(moss_dir: Path, cfg: dict):
+    """Yield (gguf_tensor_name, np.ndarray) for the DiT and the DAC VAE decoder.
+
+    Both conv flavours are shipped in PyTorch's own row-major layout, which is
+    already what ggml wants: ggml_conv_1d reads its kernel as ne=(K, IC, OC) and
+    PyTorch's [OC, IC, K] gives exactly that, while ggml_conv_transpose_1d wants
+    ne=(K, OC, IC) and PyTorch's [IC, OC, K] gives that. No transpose either way.
+    """
+    # ── DiT ────────────────────────────────────────────────────────────────
+    dit_dir = moss_dir / "transformer"
+    with STShard(dit_dir / "diffusion_pytorch_model.safetensors") as sf:
+        for t in sorted(sf.keys()):
+            arr = sf.get_f16(t)
+            n = t
+            n = n.replace("condition_embedder.time_embedder.linear_", "t_emb.")
+            n = n.replace("condition_embedder.time_proj",             "t_proj")
+            n = n.replace("condition_embedder.text_embedder.linear_", "txt_emb.")
+            n = n.replace("patch_embedding",                          "patch")
+            n = n.replace("proj_out",                                 "head")
+            n = n.replace("blocks.",                                  "blk.")
+            n = n.replace(".attn1.",  ".sa.").replace(".attn2.", ".ca.")
+            n = n.replace("to_out.0", "o").replace("to_q", "q").replace("to_k", "k").replace("to_v", "v")
+            n = n.replace(".ffn.net.0.proj", ".ffn.1").replace(".ffn.net.2", ".ffn.2")
+            # The affine LayerNorm inside a block is norm3 in the reference but
+            # is stored as norm2 on disk; norm1/norm2 are affine-free and absent.
+            n = n.replace(".norm2.", ".norm3.")
+            n = n.replace("scale_shift_table", "mod")
+            yield "moss.dit." + n, arr
+
+    # ── DAC VAE decoder ────────────────────────────────────────────────────
+    # `continuous: True` means this is a KL-VAE, not a codec: there is no
+    # quantizer and no codebooks. Only the decoder half is needed for
+    # text-to-audio, which is 75.5 M of the checkpoint's 371 M parameters.
+    try:
+        import torch
+    except ImportError:
+        raise SystemExit("moss_soundeffect: the DAC VAE is a torch pickle; "
+                         "pip install torch to convert it")
+    sd = torch.load(moss_dir / "vae" / "vae_128d_48k.pth",
+                    map_location="cpu", weights_only=True)["state_dict"]
+    sd = {k: v.numpy() for k, v in sd.items()
+          if k.startswith("decoder.") or k.startswith("post_quant_conv.")}
+
+    def emit_conv(prefix, key):
+        """A weight-normed conv: fold g/v, pass the bias through."""
+        g, v = sd[key + ".weight_g"], sd[key + ".weight_v"]
+        yield prefix + ".weight", _fold_weight_norm(g, v).astype(np.float16)
+        yield prefix + ".bias",   sd[key + ".bias"].astype(np.float16)
+
+    def emit_snake(prefix, key):
+        """Snake: y = x + sin(a*x)^2 / (a + 1e-9).
+
+        The reciprocal is precomputed in fp32 here so the graph is a plain
+        multiply — and so it can match llama.cpp's fused Snake kernel, which
+        pattern-matches MUL->SIN->SQR->MUL->ADD with a separate inv tensor.
+        """
+        a = sd[key + ".alpha"].astype(np.float32).reshape(-1)
+        yield prefix + ".alpha", a.astype(np.float32)
+        yield prefix + ".inv",   (1.0 / (a + 1e-9)).astype(np.float32)
+
+    yield "moss.vae.post_quant.weight", sd["post_quant_conv.weight"].astype(np.float16)
+    yield "moss.vae.post_quant.bias",   sd["post_quant_conv.bias"].astype(np.float16)
+
+    for name, arr in emit_conv("moss.vae.dec.in", "decoder.model.0"):
+        yield name, arr
+
+    n_blocks = max(int(k.split(".")[2]) for k in sd
+                   if k.startswith("decoder.model.") and k.split(".")[2].isdigit()) - 1
+    for b in range(1, n_blocks):        # decoder.model.1 .. n_blocks-1
+        base = f"decoder.model.{b}"
+        pre  = f"moss.vae.dec.{b}"
+        for name, arr in emit_snake(pre + ".snake", base + ".block.0"):
+            yield name, arr
+        for name, arr in emit_conv(pre + ".up", base + ".block.1"):
+            yield name, arr
+        for r in (2, 3, 4):             # three ResidualUnits, dilations 1/3/9
+            rb = f"{base}.block.{r}.block"
+            rp = f"{pre}.res.{r - 2}"
+            for name, arr in emit_snake(rp + ".snake1", rb + ".0"):
+                yield name, arr
+            for name, arr in emit_conv(rp + ".conv1", rb + ".1"):
+                yield name, arr
+            for name, arr in emit_snake(rp + ".snake2", rb + ".2"):
+                yield name, arr
+            for name, arr in emit_conv(rp + ".conv2", rb + ".3"):
+                yield name, arr
+
+    for name, arr in emit_snake("moss.vae.dec.out.snake", f"decoder.model.{n_blocks}"):
+        yield name, arr
+    for name, arr in emit_conv("moss.vae.dec.out", f"decoder.model.{n_blocks + 1}"):
+        yield name, arr
+
+
+def write_soundeffect_kv(writer, moss_config: dict, moss_dir: Path):
+    with (moss_dir / "transformer" / "config.json").open() as f:
+        dit = json.load(f)
+    with (moss_dir / "vae" / "config.json").open() as f:
+        vae = json.load(f)
+    with (moss_dir / "scheduler" / "scheduler_config.json").open() as f:
+        sch = json.load(f)
+
+    writer.add_uint32("moss.dit.dim",        int(dit["dim"]))
+    writer.add_uint32("moss.dit.n_layers",   int(dit["num_layers"]))
+    writer.add_uint32("moss.dit.n_heads",    int(dit["num_heads"]))
+    writer.add_uint32("moss.dit.ffn_dim",    int(dit["ffn_dim"]))
+    writer.add_uint32("moss.dit.in_dim",     int(dit["in_dim"]))
+    writer.add_uint32("moss.dit.out_dim",    int(dit["out_dim"]))
+    writer.add_uint32("moss.dit.text_dim",   int(dit["text_dim"]))
+    writer.add_uint32("moss.dit.freq_dim",   int(dit["freq_dim"]))
+    writer.add_float32("moss.dit.eps",       float(dit.get("eps", 1e-6)))
+
+    writer.add_float32("moss.sched.shift",   float(sch.get("shift", 5.0)))
+    writer.add_uint32("moss.sched.train_steps",
+                      int(sch.get("num_train_timesteps", 1000)))
+
+    writer.add_uint32("moss.vae.latent_dim", int(vae.get("latent_dim", 128)))
+    # decoder_rates from the checkpoint metadata; product is the total upsample.
+    rates = [8, 5, 4, 3, 2]
+    writer.add_array("moss.vae.decoder_rates", rates)
+    hop = 1
+    for r in rates:
+        hop *= r
+    writer.add_uint32("moss.vae.hop", hop)          # 960 -> 50 latent frames/s
+
+    # Text conditioning is a fixed 512-slot window, right-padded and hard-zeroed
+    # past the real length.
+    writer.add_uint32("moss.text.max_len", 512)
+    # Duration is purely textual: the DiT always produces max_seconds worth of
+    # latents and the waveform is cropped afterwards.
+    writer.add_uint32("moss.max_seconds",
+                      int(moss_config.get("max_inference_seconds", 30)))
+
+
 class Family:
     """Everything that differs between MOSS model families."""
 
     def __init__(self, arch, backbone_config_keys, remap_backbone, collect_extras,
                  codec_version, downsample_rate, n_channels, sampling_rate,
-                 audio_start, audio_end, n_vq):
+                 audio_start, audio_end, n_vq, backbone_subdir=None,
+                 write_extra_kv=None):
         self.arch                 = arch
         self.backbone_config_keys = backbone_config_keys
         self.remap_backbone       = remap_backbone
@@ -616,6 +798,11 @@ class Family:
         self.audio_start          = audio_start
         self.audio_end            = audio_end
         self.n_vq                 = n_vq
+        # When set, the backbone is already a standalone checkpoint in this
+        # subdirectory and just needs the tokenizer alongside it — no tensor
+        # extraction or renaming.
+        self.backbone_subdir      = backbone_subdir
+        self.write_extra_kv       = write_extra_kv
 
 
 FAMILIES = {
@@ -626,6 +813,19 @@ FAMILIES = {
         collect_extras=collect_audio_extras_delay,
         codec_version=1, downsample_rate=1920, n_channels=1, sampling_rate=24000,
         audio_start=151652, audio_end=151653, n_vq=32,
+    ),
+    "moss_soundeffect": Family(
+        arch="moss_soundeffect",
+        # The text encoder is already a standalone Qwen3ForCausalLM checkpoint
+        # in text_encoder/; it only needs the tokenizer copied alongside.
+        backbone_config_keys=(),
+        backbone_subdir="text_encoder",
+        remap_backbone=None,
+        collect_extras=collect_soundeffect_extras,
+        write_extra_kv=write_soundeffect_kv,
+        # Not an RVQ model at all: DiT + flow matching + a continuous KL-VAE.
+        codec_version=0, downsample_rate=960, n_channels=1, sampling_rate=48000,
+        audio_start=0, audio_end=0, n_vq=0,
     ),
     "moss_tts_local": Family(
         arch="moss_tts_local",
@@ -648,6 +848,8 @@ def detect_family(moss_config: dict, override: str | None = None) -> Family:
     mt = str(moss_config.get("model_type", "")).strip()
     if mt in FAMILIES:
         return FAMILIES[mt]
+    if moss_config.get("_class_name") == "MossSoundEffectPipeline":
+        return FAMILIES["moss_soundeffect"]
     for a in moss_config.get("architectures", []):
         if a == "MossTTSLocalModel":
             return FAMILIES["moss_tts_local"]
@@ -741,12 +943,22 @@ def write_moss_sidecar(out_gguf: Path,
                 f"moss_tts_local: only local_text_head_mode='binary' is supported, "
                 f"got {mode!r}")
 
+    if fam.write_extra_kv is not None:
+        fam.write_extra_kv(writer, moss_config, moss_dir)
+
     writer.add_bool("moss.codec.present", codec_dir is not None)
 
     # ── 2. add MOSS audio tensors ──────────────────────────────────────────
+    #
+    # f16 is the default, but a collector that deliberately produced f32 keeps
+    # it. That matters: MOSS-SoundEffect's Snake activation ships a precomputed
+    # 1/(alpha + 1e-9), and three of those reciprocals exceed f16's 65504 ceiling
+    # (alpha gets as small as 8.3e-6, giving 1.2e5). Rounding them to inf would
+    # feed inf into the decoder and corrupt the waveform silently.
     audio_count = 0
     for name, arr in fam.collect_extras(moss_dir, moss_config):
-        writer.add_tensor(name, arr.astype(np.float16))
+        writer.add_tensor(name, arr if arr.dtype == np.float32
+                                else arr.astype(np.float16))
         audio_count += 1
     log.info("added %d MOSS audio/head tensors", audio_count)
 
@@ -772,7 +984,10 @@ def write_moss_sidecar(out_gguf: Path,
 
 def resolve_model_dir(spec: str, cache_dir: str | None) -> Path:
     p = Path(spec)
-    if p.is_dir() and (p / "config.json").exists():
+    # diffusers pipelines (MOSS-SoundEffect) describe themselves in
+    # model_index.json and have no top-level config.json.
+    if p.is_dir() and ((p / "config.json").exists()
+                       or (p / "model_index.json").exists()):
         return p.resolve()
     log.info("downloading %s from HuggingFace", spec)
     from huggingface_hub import snapshot_download
@@ -832,7 +1047,11 @@ def main():
         scratch = Path(tempfile.mkdtemp(prefix="moss-convert-"))
         cleanup_scratch = not args.keep_scratch
 
-    with (moss_dir / "config.json").open() as f:
+    cfg_path = moss_dir / "config.json"
+    if not cfg_path.exists():
+        # diffusers pipelines describe themselves in model_index.json instead
+        cfg_path = moss_dir / "model_index.json"
+    with cfg_path.open() as f:
         moss_config = json.load(f)
     fam = detect_family(moss_config, args.arch)
     log.info("model family: %s", fam.arch)
@@ -850,7 +1069,10 @@ def main():
                 log.info("=== stages 1+2 skipped (using cached %s) ===", backbone_gguf)
             else:
                 log.info("=== stage 1: extract Qwen3 backbone ===")
-                extract_qwen3_backbone(moss_dir, qwen3_dir, fam, moss_config)
+                if fam.backbone_subdir:
+                    assemble_backbone_dir(moss_dir, qwen3_dir, fam)
+                else:
+                    extract_qwen3_backbone(moss_dir, qwen3_dir, fam, moss_config)
 
                 log.info("=== stage 2: convert backbone to GGUF (via llama.cpp) ===")
                 run_llama_cpp_converter(qwen3_dir, backbone_gguf,
