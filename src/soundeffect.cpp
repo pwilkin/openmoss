@@ -215,8 +215,8 @@ SoundEffectResult generate_sound_effect(Model & model,
     auto t0 = clock_t_::now();
     DiTContextPtr ctx_pos, ctx_neg;
     {
-        const auto ctx = encode_text(model, res.prompt, res.n_prompt_tokens);
-        ctx_pos = dit.encode_context(ctx.data(), d.text_max_len);
+        res.context = encode_text(model, res.prompt, res.n_prompt_tokens);
+        ctx_pos = dit.encode_context(res.context.data(), d.text_max_len);
     }
     if (req.cfg_scale != 1.0f) {
         // The empty negative prompt gives exactly zeros, with no text encoder

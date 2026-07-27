@@ -47,8 +47,9 @@ struct Args {
     std::optional<float> seconds, cfg_scale, sigma_shift;
     std::optional<int>   steps;
     std::optional<std::string> negative_prompt;
-    std::optional<std::string> dump_latent, init_latent;
+    std::optional<std::string> dump_latent, init_latent, dump_context;
     bool no_duration_suffix = false;
+    bool vk_f32 = false;
 };
 
 [[noreturn]] void usage(int code) {
@@ -109,6 +110,19 @@ struct Args {
         "  --dump-latent PATH     Write the final latent as raw f32\n"
         "  --init-latent PATH     Read the starting noise from raw f32 instead of\n"
         "                         seeding it, for diffing against a reference\n"
+        "  --dump-context PATH    Write the text conditioning as raw f32. Worth\n"
+        "                         diffing on its own: guidance decays to under 1%%\n"
+        "                         of the velocity within a few steps, so the final\n"
+        "                         latent barely tests the text encoder\n"
+        "  --vk-f32               Recommended on Vulkan. Sets GGML_VK_DISABLE_F16,\n"
+        "                         which stops the backend accumulating libllama's\n"
+        "                         matmuls in f16. That costs the text encoder ~3%%\n"
+        "                         relative error, and the DiT cross-attends to it on\n"
+        "                         every one of the ~200 forward passes: it moves the\n"
+        "                         final latent from 1.7e-2 to 1.1e-3 against the fp32\n"
+        "                         reference, with no measurable slowdown. The graphs\n"
+        "                         in this repo already force f32 accumulation, so\n"
+        "                         this only affects the backbone.\n"
     );
     std::exit(code);
 }
@@ -166,10 +180,16 @@ int main(int argc, char ** argv) {
         else if (k == "--no-duration-suffix") a.no_duration_suffix = true;
         else if (k == "--dump-latent")     a.dump_latent = require_str(i, argc, argv);
         else if (k == "--init-latent")     a.init_latent = require_str(i, argc, argv);
+        else if (k == "--dump-context")    a.dump_context = require_str(i, argc, argv);
+        else if (k == "--vk-f32")          a.vk_f32 = true;
         else if (k == "--help" || k == "-h") usage(0);
         else { std::fprintf(stderr, "unknown arg: %s\n", k.c_str()); usage(2); }
     }
     if (a.model_path.empty() || a.text.empty()) usage(2);
+
+    // Must precede Model::load: the Vulkan backend reads this when it
+    // initialises the device, which happens during the load.
+    if (a.vk_f32) setenv("GGML_VK_DISABLE_F16", "1", /*overwrite=*/0);
 
     openmoss::LoadOptions lo;
     lo.n_gpu_layers = a.n_gpu_layers;
@@ -216,6 +236,15 @@ int main(int argc, char ** argv) {
                      "[sfx] text %.2fs, solve %.2fs, decode %.2fs\n",
                      result.prompt.c_str(), result.n_prompt_tokens, result.n_latents,
                      result.text_seconds, result.sample_seconds, result.decode_seconds);
+
+        if (a.dump_context) {
+            std::ofstream f(*a.dump_context, std::ios::binary);
+            if (!f) { std::fprintf(stderr, "cannot open %s\n", a.dump_context->c_str()); return 1; }
+            f.write(reinterpret_cast<const char *>(result.context.data()),
+                    std::streamsize(result.context.size() * sizeof(float)));
+            std::fprintf(stderr, "wrote context (%zu floats) to %s\n",
+                         result.context.size(), a.dump_context->c_str());
+        }
 
         if (a.dump_latent) {
             std::ofstream f(*a.dump_latent, std::ios::binary);

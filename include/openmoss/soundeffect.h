@@ -202,6 +202,12 @@ struct SoundEffectResult {
     // to diff against a reference without comparing audio.
     std::vector<float> latent;
 
+    // The text conditioning, (text_dim, text_max_len) channel-innermost, right
+    // padded with zeros. Worth keeping separately because the latent is a *weak*
+    // test of this path: the guidance signal decays to under 1% of the velocity
+    // within a few solver steps, so a broken text encoder still lands close.
+    std::vector<float> context;
+
     double text_seconds = 0.0, sample_seconds = 0.0, decode_seconds = 0.0;
 };
 
