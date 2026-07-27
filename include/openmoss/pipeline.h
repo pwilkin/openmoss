@@ -18,7 +18,8 @@ namespace openmoss {
 
 struct GenerateRequest {
     std::string text;
-    std::optional<std::vector<float>> reference_wav;   // mono f32 @ 24 kHz
+    // Channel-interleaved f32 at the model's sampling rate / channel count.
+    std::optional<std::vector<float>> reference_wav;
     std::optional<std::string>        instruction;     // e.g. voice description
     std::optional<std::string>        language;        // "en", "zh", ...
     std::optional<std::string>        quality;         // upstream "quality" hint
@@ -28,8 +29,17 @@ struct GenerateRequest {
 };
 
 struct GenerateResult {
-    std::vector<float> waveform;       // mono f32 @ 24 kHz
+    // Channel-interleaved f32 at the model's sampling rate. Length is
+    // n_audio_frames * downsample_rate * n_channels.
+    std::vector<float> waveform;
+    int32_t            n_channels = 1;
     int32_t            n_audio_frames; // before upsampling
+
+    // The raw codec codes behind `waveform`, (n_codebooks, n_audio_frames)
+    // row-major. Kept so callers can diff against a reference implementation
+    // without having to compare audio.
+    std::vector<int32_t> audio_codes;
+    int32_t              n_codebooks = 0;
     double             prefill_seconds = 0.0;
     double             generate_seconds = 0.0;
     double             decode_seconds   = 0.0;

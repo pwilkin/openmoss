@@ -22,28 +22,7 @@ namespace openmoss {
 // across requests on the persistent server).
 struct Rng;
 
-struct SamplingConfig {
-    float text_temperature  = 1.5f;
-    float text_top_p        = 1.0f;
-    int   text_top_k        = 50;
-
-    float audio_temperature       = 1.7f;
-    float audio_top_p             = 0.8f;
-    int   audio_top_k             = 25;
-    float audio_repetition_penalty = 1.0f;
-
-    // Forbid the end-of-segment delay slot until at least this many audio frames
-    // have been generated. Prevents the model from collapsing the segment on the
-    // first frame (degenerate immediate end-of-speech). 0 = no floor.
-    int min_audio_frames = 0;
-
-    // Force the end-of-segment delay slot once this many audio frames exist.
-    // Bounds the segment so the model can't ramble far past the requested length.
-    // 0 = no cap.
-    int max_audio_frames = 0;
-
-    uint64_t seed = 0; // 0 = nondeterministic
-};
+// SamplingConfig now lives in model.h — it is shared by every family.
 
 // Per-step result: (1 + n_vq) ids for the *next* position.
 struct DelayStep {

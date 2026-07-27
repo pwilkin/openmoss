@@ -74,6 +74,23 @@ bool kv_bool(gguf_context * gctx, const char * key, bool fallback) {
     return gguf_get_val_bool(gctx, k);
 }
 
+float kv_f32(gguf_context * gctx, const char * key, float fallback) {
+    int64_t k = gguf_find_key(gctx, key);
+    if (k < 0) return fallback;
+    switch (gguf_get_kv_type(gctx, k)) {
+        case GGUF_TYPE_FLOAT32: return gguf_get_val_f32(gctx, k);
+        case GGUF_TYPE_FLOAT64: return float(gguf_get_val_f64(gctx, k));
+        default: return fallback;
+    }
+}
+
+std::string kv_str(gguf_context * gctx, const char * key, const std::string & fallback) {
+    int64_t k = gguf_find_key(gctx, key);
+    if (k < 0) return fallback;
+    if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_STRING) return fallback;
+    return gguf_get_val_str(gctx, k);
+}
+
 // Enumerate registered ggml devices that report as GPU/IGPU/ACCEL, deduplicated
 // by PCI id. libllama drops a device whose id already appeared (e.g. the Vulkan
 // view of a GPU already claimed by CUDA when both backends are loaded), so the
@@ -138,11 +155,32 @@ ggml_backend_dev_t pick_gpu_device(int hint, int & gpu_index_out) {
 }
 
 void read_moss_kv(gguf_context * gctx, ModelDims & d, bool & codec_present) {
+    // Architecture first — everything else is family-dependent. Prefer the
+    // explicit `moss.architecture` key, fall back to `general.architecture`
+    // (written by every converter revision), and finally to the ModelDims
+    // default so pre-multi-family GGUFs keep loading as MOSS-TTS-Delay.
+    {
+        std::string a = kv_str(gctx, "moss.architecture",
+                               kv_str(gctx, "general.architecture", ""));
+        if (!a.empty() && !arch_from_name(a, d.arch)) {
+            throw std::runtime_error("Model::load: unknown moss.architecture \"" + a + "\"");
+        }
+    }
+
     d.n_vq             = int32_t(kv_u32(gctx, "moss.n_vq", uint32_t(d.n_vq)));
     d.audio_vocab_size = int32_t(kv_u32(gctx, "moss.audio_vocab_size", uint32_t(d.audio_vocab_size)));
     d.audio_pad_code   = int32_t(kv_u32(gctx, "moss.audio_pad_code", uint32_t(d.audio_pad_code)));
     d.sampling_rate    = int32_t(kv_u32(gctx, "moss.sampling_rate", uint32_t(d.sampling_rate)));
     d.downsample_rate  = int32_t(kv_u32(gctx, "moss.downsample_rate", uint32_t(d.downsample_rate)));
+    d.n_channels       = int32_t(kv_u32(gctx, "moss.codec.number_channels", uint32_t(d.n_channels)));
+    d.codec_version    = int32_t(kv_u32(gctx, "moss.codec.version", uint32_t(d.codec_version)));
+
+    d.local_n_layer    = int32_t(kv_u32(gctx, "moss.local.n_layer", uint32_t(d.local_n_layer)));
+    d.local_n_embd     = int32_t(kv_u32(gctx, "moss.local.n_embd",  uint32_t(d.local_n_embd)));
+    d.local_n_head     = int32_t(kv_u32(gctx, "moss.local.n_head",  uint32_t(d.local_n_head)));
+    d.local_n_inner    = int32_t(kv_u32(gctx, "moss.local.n_inner", uint32_t(d.local_n_inner)));
+    d.local_rope_base  = kv_f32(gctx, "moss.local.rope_base", d.local_rope_base);
+    d.local_ln_eps     = kv_f32(gctx, "moss.local.ln_eps",    d.local_ln_eps);
 
     d.audio_start_token_id          = int32_t(kv_u32(gctx, "moss.token.audio_start", uint32_t(d.audio_start_token_id)));
     d.audio_end_token_id            = int32_t(kv_u32(gctx, "moss.token.audio_end",   uint32_t(d.audio_end_token_id)));
@@ -240,6 +278,35 @@ void collect_moss_names(LoadSpec & spec, bool include_codec) {
 } // namespace
 
 // ───────────────────────────────────────────────────────────────────────────
+// Architecture ids
+// ───────────────────────────────────────────────────────────────────────────
+
+const char * arch_name(Arch a) {
+    switch (a) {
+        case Arch::TTSDelay: return "moss_tts_delay";
+        case Arch::TTSLocal: return "moss_tts_local";
+    }
+    return "unknown";
+}
+
+bool arch_from_name(const std::string & name, Arch & out) {
+    if (name == "moss_tts_delay") { out = Arch::TTSDelay; return true; }
+    if (name == "moss_tts_local") { out = Arch::TTSLocal; return true; }
+    return false;
+}
+
+SamplingConfig default_sampling(Arch arch) {
+    SamplingConfig sc;   // struct defaults are the MOSS-TTS-Delay values
+    if (arch == Arch::TTSLocal) {
+        // sglang-omni's moss_tts_local cookbook: the "text" channel here is the
+        // per-frame continue/stop head over a 2-way vocab, so top_p=1.0 and
+        // top_k=50 are both inert and only the temperature matters.
+        sc.text_temperature = 1.0f;
+    }
+    return sc;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Model
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -256,7 +323,13 @@ ggml_tensor * Model::audio_embed(int i) const {
 ggml_tensor * Model::audio_head(int i) const {
     if (!m_aux) return nullptr;
     auto it = m_aux->tensors.find("moss.audio_head." + std::to_string(i) + ".weight");
-    return it == m_aux->tensors.end() ? nullptr : it->second;
+    if (it != m_aux->tensors.end()) return it->second;
+    // MOSS-TTS-Local ties head i to embedding table i (verified byte-identical
+    // upstream), so the converter ships only the embedding. Note the embedding
+    // carries one extra all-zero pad row: callers using this as a head matrix
+    // must view the first audio_vocab_size rows, or the pad code becomes a
+    // sampleable class with logit 0.
+    return audio_embed(i);
 }
 
 int32_t Model::n_audio_embed_loaded() const {
@@ -473,12 +546,34 @@ std::unique_ptr<Model> Model::load(const std::string & gguf_path, const LoadOpti
         ggml_gallocr_new(ggml_backend_get_default_buffer_type(self->m_aux->backend));
 
     std::fprintf(stderr,
-        "Model::load: loaded %d audio embeds, %d audio heads, codec=%s, text_embed=%s (text vocab %d)\n",
+        "Model::load: arch=%s, %d audio embeds, %d audio heads, codec=%s (v%d, %d ch @ %d Hz), "
+        "text_embed=%s (text vocab %d)\n",
+        arch_name(self->m_dims.arch),
         self->n_audio_embed_loaded(),
         self->n_audio_head_loaded(),
         self->m_aux->codec_present ? "yes" : "no",
+        self->m_dims.codec_version,
+        self->m_dims.n_channels,
+        self->m_dims.sampling_rate,
         self->m_aux->text_embed ? "yes" : "no",
         self->m_aux->text_vocab_size);
+
+    // MOSS-TTS-Local ties every audio head to its embedding table, so the
+    // converter drops the duplicates; the local transformer is what turns a
+    // frame latent into codes. Fail loudly here rather than at the first
+    // generation step if the sidecar predates local-transformer support.
+    if (self->m_dims.arch == Arch::TTSLocal) {
+        if (self->m_dims.local_n_layer <= 0) {
+            throw std::runtime_error(
+                "Model::load: arch is moss_tts_local but the sidecar carries no "
+                "local-transformer geometry (moss.local.n_layer); reconvert the model");
+        }
+        if (!self->m_aux->tensors.count("moss.local_text_head.weight")) {
+            throw std::runtime_error(
+                "Model::load: arch is moss_tts_local but moss.local_text_head.weight "
+                "is missing from the sidecar; reconvert the model");
+        }
+    }
 
     // ── 3. Tokenizer wrapper ────────────────────────────────────────────────
     self->m_tokenizer = std::make_unique<Tokenizer>(self->m_backbone_model);

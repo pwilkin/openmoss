@@ -40,6 +40,8 @@ add_library(openmoss_core STATIC
     src/model.cpp
     src/tokenizer.cpp
     src/delay.cpp
+    src/frame_decoder.cpp
+    src/local_transformer.cpp
     src/codec.cpp
     src/pipeline.cpp
     src/wav.cpp

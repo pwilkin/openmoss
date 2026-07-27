@@ -21,11 +21,13 @@
 
 #include "openmoss/pipeline.h"
 #include "openmoss/codec.h"
+#include "openmoss/frame_decoder.h"
 #include "openmoss/tokenizer.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -182,6 +184,93 @@ std::vector<int32_t> build_prompt_grid(const Tokenizer & tok,
     return grid;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// MOSS-TTS-Local prompt builder
+//
+// Two things differ from the delay family beyond the template text:
+//
+//  1. Reference audio codes go in 1:1 and unshifted — one grid row per codec
+//     frame, text column = audio_user_slot — with no delay ramp, no trailing
+//     (n_vq - 1) slot padding, and NO "[S1]:" speaker label. Upstream drops the
+//     label deliberately: it changes the token sequence and degrades voice-clone
+//     conditioning.
+//
+//  2. The prompt is tokenized **segment by segment**, never as one string.
+//     One-pass encoding produces different ids: BPE merges the synthesis text's
+//     trailing "." with the following "\n" into a single token (id 624) where
+//     the segmented encoder emits 13 ("." ) + 198 ("\n"). Several other seams
+//     behave the same way ('。', '!', '  ', and ':\n\n' when the text starts
+//     with a newline). Getting this wrong shifts every downstream position.
+// ───────────────────────────────────────────────────────────────────────────
+
+void append_text_rows(std::vector<int32_t> & grid, int32_t cols, int32_t pad,
+                      const std::vector<int32_t> & ids) {
+    for (int32_t id : ids) {
+        grid.push_back(id);
+        for (int32_t c = 1; c < cols; ++c) grid.push_back(pad);
+    }
+}
+
+std::vector<int32_t> build_prompt_grid_local(const Tokenizer & tok,
+                                             const ModelDims & d,
+                                             const GenerateRequest & req,
+                                             const std::vector<int32_t> * ref_codes,
+                                             int32_t T_ref,
+                                             int32_t & n_pos_out) {
+    const int32_t cols = 1 + d.n_vq;
+    const int32_t pad  = d.audio_pad_code;
+
+    auto enc = [&](const std::string & s) { return tok.encode(s, /*add_special=*/false); };
+
+    std::vector<int32_t> grid;
+
+    // <|im_start|>user\n<user_inst>\n- Reference(s):\n
+    append_text_rows(grid, cols, pad, { d.im_start_token_id });
+    append_text_rows(grid, cols, pad, enc("user\n"));
+    append_text_rows(grid, cols, pad, enc("<user_inst>\n- Reference(s):\n"));
+
+    if (ref_codes && T_ref > 0) {
+        append_text_rows(grid, cols, pad, { d.audio_start_token_id });
+        for (int32_t t = 0; t < T_ref; ++t) {
+            grid.push_back(d.audio_user_slot_token_id);
+            for (int32_t i = 0; i < d.n_vq; ++i) {
+                grid.push_back((*ref_codes)[size_t(i) * size_t(T_ref) + size_t(t)]);
+            }
+        }
+        append_text_rows(grid, cols, pad, { d.audio_end_token_id });
+    } else {
+        append_text_rows(grid, cols, pad, enc("None"));
+    }
+
+    // Everything between the reference block and the synthesis text is one
+    // segment upstream, so encode it as one.
+    {
+        std::string mid;
+        mid += "\n- Instruction:\n"   + default_or_none(req.instruction);
+        mid += "\n- Tokens:\n"        + default_or_none(req.tokens);
+        mid += "\n- Quality:\n"       + default_or_none(req.quality);
+        mid += "\n- Sound Event:\nNone";
+        mid += "\n- Ambient Sound:\nNone";
+        mid += "\n- Language:\n"      + default_or_none(req.language);
+        mid += "\n- Text:\n";
+        append_text_rows(grid, cols, pad, enc(mid));
+    }
+
+    // The synthesis text is its own segment — see (2) above.
+    append_text_rows(grid, cols, pad, enc(req.text));
+
+    // \n</user_inst><|im_end|>\n<|im_start|>assistant\n<|audio_start|>
+    append_text_rows(grid, cols, pad, enc("\n</user_inst>"));
+    append_text_rows(grid, cols, pad, { d.im_end_token_id });
+    append_text_rows(grid, cols, pad, enc("\n"));
+    append_text_rows(grid, cols, pad, { d.im_start_token_id });
+    append_text_rows(grid, cols, pad, enc("assistant\n"));
+    append_text_rows(grid, cols, pad, { d.audio_start_token_id });
+
+    n_pos_out = int32_t(grid.size() / size_t(cols));
+    return grid;
+}
+
 // Feed an (n_tokens, hidden) f32 buffer into libllama via batch.embd.
 // `pos_start` is the position id for the first row.
 // `output_last` controls whether the last row should produce logits.
@@ -244,19 +333,31 @@ GenerateResult generate(Model & model,
         }
         std::fprintf(stderr, "[generate] encoded reference: %d frames (%.2fs) in %.2fs\n",
                      T_ref,
-                     T_ref * 1920.0 / double(d.sampling_rate),
+                     T_ref * double(d.downsample_rate) / double(d.sampling_rate),
                      seconds_t(clock_t_::now() - t_enc).count());
-        reference_block = build_reference_audio_block(*tok, d, T_ref);
+        if (d.arch == Arch::TTSDelay) {
+            reference_block = build_reference_audio_block(*tok, d, T_ref);
+        }
     }
 
     // ── 1. Prompt grid ─────────────────────────────────────────────────────
     int32_t prompt_len = 0;
-    auto grid = build_prompt_grid(*tok, d, req, reference_block,
-                                   T_ref > 0 ? &ref_codes : nullptr, T_ref,
-                                   prompt_len);
+    std::vector<int32_t> grid;
+    switch (d.arch) {
+        case Arch::TTSDelay:
+            grid = build_prompt_grid(*tok, d, req, reference_block,
+                                     T_ref > 0 ? &ref_codes : nullptr, T_ref,
+                                     prompt_len);
+            break;
+        case Arch::TTSLocal:
+            grid = build_prompt_grid_local(*tok, d, req,
+                                           T_ref > 0 ? &ref_codes : nullptr, T_ref,
+                                           prompt_len);
+            break;
+    }
     std::fprintf(stderr, "[generate] prompt_len = %d tokens\n", prompt_len);
 
-    // Initialise DelayState from the prompt grid.
+    // Seed the family's frame decoder from the prompt grid.
     std::vector<std::vector<int32_t>> history;
     history.reserve(size_t(prompt_len) + size_t(req.max_new_tokens));
     for (int32_t r = 0; r < prompt_len; ++r) {
@@ -264,7 +365,7 @@ GenerateResult generate(Model & model,
                                   grid.begin() + (r + 1) * (1 + n_vq));
         history.push_back(std::move(row));
     }
-    DelayState state(d, history);
+    std::unique_ptr<IFrameDecoder> decoder = make_frame_decoder(model, history);
 
     // ── 2. Prefill ─────────────────────────────────────────────────────────
     auto t0 = clock_t_::now();
@@ -283,7 +384,7 @@ GenerateResult generate(Model & model,
     auto t_gen = clock_t_::now();
     int32_t pos = prompt_len;
     int32_t step = 0;
-    DelayStep last_step;
+    FrameStep last_step;
     for (; step < req.max_new_tokens; ++step) {
         const float * text_logits = llama_get_logits_ith(model.backbone_ctx(), -1);
         const float * hidden_vec  = llama_get_embeddings_ith(model.backbone_ctx(), -1);
@@ -291,9 +392,9 @@ GenerateResult generate(Model & model,
             throw std::runtime_error("generate: llama_get_logits/embeddings_ith returned null");
         }
 
-        auto audio_logits = model.compute_audio_logits(hidden_vec); // (n_vq, Vfull)
-
-        last_step = state.step(text_logits, audio_logits.data(), req.sampling);
+        // The decoder owns head invocation — the two families disagree on
+        // whether the audio heads can run before any code is sampled.
+        last_step = decoder->step(text_logits, hidden_vec, req.sampling);
         if (last_step.stop) {
             std::fprintf(stderr, "[generate] stop at step %d\n", step);
             break;
@@ -320,20 +421,25 @@ GenerateResult generate(Model & model,
 
     // ── 4. Extract audio codes ─────────────────────────────────────────────
     int32_t nvq_out = 0, t_audio = 0;
-    auto codes = state.extract_audio_codes(nvq_out, t_audio);
+    auto codes = decoder->extract_audio_codes(nvq_out, t_audio);
     result.n_audio_frames = t_audio;
+    result.n_codebooks    = nvq_out;
+    result.audio_codes    = codes;
     std::fprintf(stderr, "[generate] %d audio frames extracted\n", t_audio);
 
     // ── 5. Codec decode → waveform ─────────────────────────────────────────
+    result.n_channels = d.n_channels;
     if (t_audio > 0 && model.codec_loaded()) {
         try {
             auto t_dec = clock_t_::now();
             result.waveform = codec_decode(model, codes.data(), nvq_out, t_audio);
             result.decode_seconds = seconds_t(clock_t_::now() - t_dec).count();
-            std::fprintf(stderr, "[generate] codec decode produced %zu samples (%.2fs of audio) in %.2fs\n",
+            std::fprintf(stderr,
+                         "[generate] codec decode produced %zu samples (%.2fs of audio, %d ch) in %.2fs\n",
                          result.waveform.size(),
-                         result.waveform.size() / double(d.sampling_rate),
-                         result.decode_seconds);
+                         double(result.waveform.size())
+                             / double(d.sampling_rate) / double(d.n_channels),
+                         d.n_channels, result.decode_seconds);
         } catch (const std::exception & e) {
             std::fprintf(stderr, "[generate] codec_decode failed: %s\n", e.what());
             result.decode_seconds = 0.0;

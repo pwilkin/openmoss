@@ -36,6 +36,9 @@
 //          → softmax → multinomial draw
 
 #include "openmoss/delay.h"
+#include "openmoss/frame_decoder.h"
+
+#include "sampling_internal.h"
 
 #include <algorithm>
 #include <cmath>
@@ -53,131 +56,12 @@ namespace openmoss {
 // Sampling helpers (CPU side; logits are tiny — vocab ≤ 1025 audio, ~155k text)
 // ──────────────────────────────────────────────────────────────────────────
 
-// Declared in delay.h (forward-declared there, defined here) so DelayState can
-// own one per instance.
-struct Rng {
-    std::mt19937_64 g;
-    explicit Rng(uint64_t seed) {
-        if (seed == 0) {
-            std::random_device rd;
-            seed = (uint64_t(rd()) << 32) | rd();
-        }
-        g.seed(seed);
-    }
-    float uniform01() {
-        return std::uniform_real_distribution<float>(0.f, 1.f)(g);
-    }
-};
+// Rng and the sampling primitives live in sampling_internal.h — they are
+// shared verbatim with the local-transformer decoder.
+using sampling::apply_repetition_penalty;
+using sampling::softmax_inplace;
+using sampling::sample_one;
 
-namespace {
-
-// Penalize each token that appears in the history exactly ONCE, no matter how
-// often it occurs — the reference (`apply_repetition_penalty_delay_pattern`)
-// runs the penalty over `torch.unique(prev_tokens)`. Penalizing per occurrence
-// compounds to penalty^k for a token seen k times; with a 1024-code audio
-// vocab at 12.5 frames/s that distorts the distribution more every second.
-void apply_repetition_penalty(float * logits, int vocab,
-                              const std::vector<int32_t> & history,
-                              float penalty) {
-    if (penalty == 1.0f) return;
-    std::vector<bool> seen(size_t(vocab), false);
-    for (int32_t id : history) {
-        if (id < 0 || id >= vocab || seen[size_t(id)]) continue;
-        seen[size_t(id)] = true;
-        if (logits[id] > 0) logits[id] /= penalty;
-        else                logits[id] *= penalty;
-    }
-}
-
-// Softmax in place over a contiguous logits buffer (with -inf entries as masks).
-void softmax_inplace(float * x, int n) {
-    float mx = -std::numeric_limits<float>::infinity();
-    for (int i = 0; i < n; ++i) if (x[i] > mx) mx = x[i];
-    if (!std::isfinite(mx)) {
-        // All-masked; keep zeros for caller to handle.
-        std::fill(x, x + n, 0.f);
-        return;
-    }
-    float sum = 0.f;
-    for (int i = 0; i < n; ++i) {
-        x[i] = std::exp(x[i] - mx);
-        sum += x[i];
-    }
-    if (sum <= 0.f) { std::fill(x, x + n, 0.f); return; }
-    const float inv = 1.f / sum;
-    for (int i = 0; i < n; ++i) x[i] *= inv;
-}
-
-int32_t sample_one(float * logits, int vocab, float temperature,
-                   float top_p, int top_k, bool do_sample, Rng & rng) {
-    if (!do_sample) {
-        // Argmax
-        int best = 0;
-        for (int i = 1; i < vocab; ++i) if (logits[i] > logits[best]) best = i;
-        return best;
-    }
-
-    if (temperature > 0.f && temperature != 1.f) {
-        const float inv = 1.f / temperature;
-        for (int i = 0; i < vocab; ++i) logits[i] *= inv;
-    }
-
-    // top-k: build a list of (id, logit) pairs and pick the K largest.
-    if (top_k > 0 && top_k < vocab) {
-        std::vector<std::pair<float,int32_t>> v;
-        v.reserve(vocab);
-        for (int i = 0; i < vocab; ++i) {
-            if (std::isfinite(logits[i])) v.emplace_back(logits[i], i);
-        }
-        if (int(v.size()) > top_k) {
-            std::nth_element(v.begin(), v.begin() + top_k, v.end(),
-                             [](auto & a, auto & b){ return a.first > b.first; });
-            v.resize(top_k);
-        }
-        // Mask everything except the top-k by zeroing logits.
-        std::vector<bool> keep(vocab, false);
-        for (auto & p : v) keep[p.second] = true;
-        for (int i = 0; i < vocab; ++i)
-            if (!keep[i]) logits[i] = -std::numeric_limits<float>::infinity();
-    }
-
-    softmax_inplace(logits, vocab);
-
-    // top-p: sort, accumulate, mask the tail.
-    if (top_p > 0.f && top_p < 1.f) {
-        std::vector<int32_t> order(vocab);
-        for (int i = 0; i < vocab; ++i) order[i] = i;
-        std::sort(order.begin(), order.end(),
-                  [&](int32_t a, int32_t b){ return logits[a] > logits[b]; });
-        float acc = 0.f;
-        size_t cut = order.size();
-        for (size_t i = 0; i < order.size(); ++i) {
-            acc += logits[order[i]];
-            if (acc >= top_p) { cut = i + 1; break; }
-        }
-        // Renormalise the kept set.
-        float sum = 0.f;
-        for (size_t i = 0; i < cut;            ++i) sum += logits[order[i]];
-        for (size_t i = cut; i < order.size(); ++i) logits[order[i]] = 0.f;
-        if (sum > 0.f) {
-            const float inv = 1.f / sum;
-            for (size_t i = 0; i < cut; ++i) logits[order[i]] *= inv;
-        }
-    }
-
-    // Multinomial draw via inverse CDF.
-    const float u = rng.uniform01();
-    float acc = 0.f;
-    for (int i = 0; i < vocab; ++i) {
-        acc += logits[i];
-        if (acc >= u) return i;
-    }
-    // Fallback for floating-point sum < 1.0
-    for (int i = vocab - 1; i >= 0; --i) if (logits[i] > 0.f) return i;
-    return 0;
-}
-
-} // namespace
 
 // ──────────────────────────────────────────────────────────────────────────
 // DelayState
@@ -412,6 +296,54 @@ std::vector<int32_t> DelayState::extract_audio_codes(int32_t & n_vq_out, int32_t
         }
     }
     return out;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// IFrameDecoder adapter
+//
+// The delay pattern projects the backbone hidden state through all n_vq heads
+// up front, so this is a thin wrapper: run the heads, then hand the dense
+// (n_vq, Vfull) logits block to DelayState exactly as before.
+// ───────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+class DelayFrameDecoder final : public IFrameDecoder {
+public:
+    DelayFrameDecoder(Model & model,
+                      const std::vector<std::vector<int32_t>> & prompt_rows)
+        : m_model(model), m_state(model.dims(), prompt_rows),
+          m_row_width(1 + model.dims().n_vq) {}
+
+    FrameStep step(const float * text_logits,
+                   const float * hidden,
+                   const SamplingConfig & sc) override {
+        const std::vector<float> audio_logits = m_model.compute_audio_logits(hidden);
+        DelayStep s = m_state.step(text_logits, audio_logits.data(), sc);
+        FrameStep out;
+        out.ids  = std::move(s.ids);
+        out.stop = s.stop;
+        return out;
+    }
+
+    std::vector<int32_t> extract_audio_codes(int32_t & n_cb_out,
+                                             int32_t & t_audio_out) const override {
+        return m_state.extract_audio_codes(n_cb_out, t_audio_out);
+    }
+
+    int32_t row_width() const override { return m_row_width; }
+
+private:
+    Model &    m_model;
+    DelayState m_state;
+    int32_t    m_row_width;
+};
+
+} // namespace
+
+std::unique_ptr<IFrameDecoder> make_delay_frame_decoder(
+    Model & model, const std::vector<std::vector<int32_t>> & prompt_rows) {
+    return std::make_unique<DelayFrameDecoder>(model, prompt_rows);
 }
 
 } // namespace openmoss
