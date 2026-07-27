@@ -4,16 +4,20 @@ Branch: `feat/moss-tts-local` (off `main`). Everything below is committed.
 
 ## TL;DR
 
-**All three GGML pieces are written and verified against the PyTorch reference.**
-MOSS-SoundEffect generates end to end from the CLI, and an optional Q8_0 sidecar
-halves its size with no measurable cost to the output.
+**Done and shipped.** All three GGML pieces are written and verified against the
+PyTorch reference, MOSS-SoundEffect generates end to end from both the CLI and the
+server, and the weights are published at
+<https://huggingface.co/ilintar/moss-soundeffect-gguf>.
 
-What is left is *shipping* (needs explicit authorisation — it is a public,
-name-attributed upload) and the deferred **Phase 6 server surface**.
+Phase 6 (the server option surface) is also done. The one item deliberately left
+out is `ref_text` / continuation mode — see "What is left".
 
 ## Commits on this branch
 
 ```
+c68148b  feat(server): Phase 6 — SoundEffect endpoint and option-surface parity
+a1fae1c  docs: refresh the MOSS-SoundEffect handoff
+ce1fdcb  feat(sfx): dump the text conditioning, and --vk-f32
 7cd33b1  feat(convert): optional Q8_0 for the sidecar's projection matrices
 ba8744b  feat(sfx): flow-matching sampler and end-to-end generation
 a056bbb  feat(sfx): DAC VAE decoder
@@ -62,6 +66,22 @@ apply to this family. SoundEffect-only flags: `--seconds`, `--steps`,
 80 s solve (200 DiT passes), 8 s VAE. Cost is independent of `--seconds`,
 because the DiT always denoises the full 30 s and the waveform is cropped.
 `--cfg-scale 1` halves the solve by skipping the unconditional branch.
+
+### Over HTTP
+
+```bash
+./build/moss-tts-server --model .../moss-soundeffect-2.0.gguf --port 8080
+curl -X POST localhost:8080/sfx -H 'Content-Type: application/json' \
+     -d '{"prompt":"a dog barking twice","seconds":5,"steps":100}' -o out.wav
+```
+
+One model is loaded per server, so exactly one of `/tts` and `/sfx` applies and
+the other answers 400 pointing at the right one. `/v1/audio/speech` dispatches on
+the loaded architecture and answers for either. Also: `GET /v1/models`,
+`GET /v1/audio/voices`, `response_format` of `"wav"` or `"pcm"`, `token_count` or
+an inline `${token:N}` prefix, flattened sampling keys, and `references[]` with
+`ref_audio`. Set `GGML_VK_DISABLE_F16=1` in the environment — the server has no
+`--vk-f32` flag of its own.
 
 ## Files on disk
 
@@ -223,33 +243,42 @@ had already "passed".
 
 ## What is left
 
-### Ship it
+### `ref_text` / continuation mode — the one Phase 6 item not done
 
-The Q8_0 sidecar is verified and ready. Publishing would go to a new
-`ilintar/moss-soundeffect-gguf`. **Confirm with the user before uploading** — it
-is public and name-attributed, and that authorisation has not been given.
+Supplying a reference transcript alongside reference audio selects a different
+prompt layout upstream: *continuation mode*, with the reference audio in the
+**assistant** channel behind slot 151656 and no closing `audio_end`. The
+pipeline only builds the user-channel layout (`build_reference_audio_block` /
+`build_prompt_grid*` in `src/pipeline.cpp`), so the server **rejects `ref_text`
+with a 400** rather than accepting it and silently cloning from audio alone.
 
-Note the backbone is a plain Qwen3-1.7B GGUF and could also be quantised with
-`llama-quantize` (untested for this family; the text encoder's hidden state is
-the conditioning, so it is worth diffing `context_pos` before trusting it).
+Doing it properly means a second prompt-grid path plus verification. The cheap
+check is the one that has caught every prompt bug so far: diff the generated
+token ids against the reference processor's `build_user_message(...)`, which
+needs no model weights.
 
-### Phase 6 — the server option surface
+### Do not quantise the SoundEffect backbone
 
-Deliberately deferred to last at the user's direction, and still untouched. The
-CLI half is done. Per the sglang-omni cookbooks it needs: `references[]` with
-`ref_audio`/`ref_text` (the transcript path needs *continuation mode* —
-reference audio in the assistant channel, slot 151656, no `audio_end`),
-flattened per-channel sampling on `/v1/audio/speech`, `token_count` plus the
-inline `${token:N}` prefix, `response_format: pcm`, `GET /v1/models`, and a
-voices registry at `/v1/audio/voices` (no upstream standard exists — `voice` is
-always `"default"` in every cookbook; the vLLM-Omni convention is the closest).
+Now tested, and the handoff's suspicion was right. `llama-quantize` will process
+it happily — it is a plain Qwen3-1.7B GGUF — but the model consumes the
+encoder's *hidden state* as a continuous conditioning vector rather than turning
+logits into tokens, so the error propagates instead of being absorbed by
+sampling. Q8_0 moves the conditioning from 1.7e-3 to 2.7e-2 and the final latent
+from 1.5e-2 to 1.8e-1, correlation 0.99988 → 0.984. That is a noticeably
+different generation.
 
-SoundEffect needs its own endpoint shape too: prompt, seconds, steps, cfg_scale.
+f16 rather than the source bf16 is *not* a compromise: bf16 has 7 mantissa bits
+against f16's 10, so every bf16 weight is exactly representable as long as its
+exponent fits. Across all 2.03 B text-encoder weights none overflow, 0.157% land
+in f16's subnormal range and 1578 flush to zero, for a measured round-trip error
+of **4.7e-9** — five orders of magnitude below what compute precision costs.
 
-Streaming needs its own design pass: the TTS codec's summed receptive field is
-35 s, so block decode with warm-up is not viable and it wants per-stage KV
-caching. SoundEffect cannot stream at all in the usual sense — the solver only
-produces a usable latent after the last step.
+### Streaming
+
+Still needs its own design pass. The TTS codec's summed receptive field is 35 s,
+so block decode with warm-up is not viable and it wants per-stage KV caching.
+SoundEffect cannot stream at all in the usual sense — the solver only produces a
+usable latent after the last step.
 
 ### Smaller things
 
@@ -259,6 +288,9 @@ produces a usable latent after the last step.
   does.
 * `docs/STATUS.md` still describes only the delay family; it predates both
   MOSS-TTS-Local and this work.
+* The WebUI (`webui/`) has no SoundEffect mode — it posts to `/tts`, which now
+  answers 400 for this family. `/sfx` and the arch in `/info` are what it would
+  key off.
 
 ## Listening to output
 
