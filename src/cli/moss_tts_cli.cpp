@@ -10,7 +10,11 @@
 
 #include "openmoss/model.h"
 #include "openmoss/pipeline.h"
+#include "openmoss/soundeffect.h"
 #include "openmoss/wav.h"
+
+#include <fstream>
+#include <vector>
 
 namespace {
 
@@ -37,6 +41,14 @@ struct Args {
     bool flash_attn = true;
     bool skip_codec = false;
     bool aux_cpu    = false;
+
+    // MOSS-SoundEffect only. It is not autoregressive, so none of the sampling
+    // flags above apply; these drive the flow-matching solver instead.
+    std::optional<float> seconds, cfg_scale, sigma_shift;
+    std::optional<int>   steps;
+    std::optional<std::string> negative_prompt;
+    std::optional<std::string> dump_latent, init_latent;
+    bool no_duration_suffix = false;
 };
 
 [[noreturn]] void usage(int code) {
@@ -80,6 +92,23 @@ struct Args {
         "  --aux-cpu              Force audio embeds + codec onto CPU (workaround\n"
         "                         for backends missing ops, e.g. Metal DIAG_MASK_INF).\n"
         "                         Backbone still uses the GPU.\n"
+        "\n"
+        "MOSS-SoundEffect only (the model is a diffusion transformer, not an\n"
+        "autoregressive one, so the sampling flags above do not apply). --text\n"
+        "carries the sound description:\n"
+        "  --seconds F            Output duration (default: 10.0, capped by the model)\n"
+        "  --steps N              Solver steps (default: 100). Each costs two DiT\n"
+        "                         passes unless --cfg-scale is 1.\n"
+        "  --cfg-scale F          Classifier-free guidance (default: 4.0; 1.0 skips\n"
+        "                         the unconditional pass and halves the work)\n"
+        "  --sigma-shift F        Flow-match schedule shift (default: 5.0)\n"
+        "  --negative-prompt STR  Default is empty, which upstream treats as an\n"
+        "                         all-zero conditioning and needs no encoder pass\n"
+        "  --no-duration-suffix   Don't append ' duration: <X>s' to the prompt.\n"
+        "                         The model was trained with it; expect drift.\n"
+        "  --dump-latent PATH     Write the final latent as raw f32\n"
+        "  --init-latent PATH     Read the starting noise from raw f32 instead of\n"
+        "                         seeding it, for diffing against a reference\n"
     );
     std::exit(code);
 }
@@ -129,6 +158,14 @@ int main(int argc, char ** argv) {
         else if (k == "--no-flash-attn")   a.flash_attn = false;
         else if (k == "--skip-codec")      a.skip_codec = true;
         else if (k == "--aux-cpu")         a.aux_cpu    = true;
+        else if (k == "--seconds")         a.seconds     = require_float(i, argc, argv);
+        else if (k == "--steps")           a.steps       = require_int(i, argc, argv);
+        else if (k == "--cfg-scale")       a.cfg_scale   = require_float(i, argc, argv);
+        else if (k == "--sigma-shift")     a.sigma_shift = require_float(i, argc, argv);
+        else if (k == "--negative-prompt") a.negative_prompt = require_str(i, argc, argv);
+        else if (k == "--no-duration-suffix") a.no_duration_suffix = true;
+        else if (k == "--dump-latent")     a.dump_latent = require_str(i, argc, argv);
+        else if (k == "--init-latent")     a.init_latent = require_str(i, argc, argv);
         else if (k == "--help" || k == "-h") usage(0);
         else { std::fprintf(stderr, "unknown arg: %s\n", k.c_str()); usage(2); }
     }
@@ -143,6 +180,61 @@ int main(int argc, char ** argv) {
     lo.skip_codec   = a.skip_codec;
     lo.aux_cpu      = a.aux_cpu;
     auto model = openmoss::Model::load(a.model_path, lo);
+
+    // MOSS-SoundEffect is not autoregressive: no prompt grid, no codes, no
+    // sampling. It takes the flow-matching path instead, sharing only the model
+    // loader and the WAV writer with the two TTS families.
+    if (model->dims().arch == openmoss::Arch::SoundEffect) {
+        openmoss::SoundEffectRequest sreq;
+        sreq.prompt = a.text;
+        if (a.seconds)     sreq.seconds             = *a.seconds;
+        if (a.steps)       sreq.num_inference_steps = *a.steps;
+        if (a.cfg_scale)   sreq.cfg_scale           = *a.cfg_scale;
+        if (a.sigma_shift) sreq.sigma_shift         = *a.sigma_shift;
+        if (a.negative_prompt) sreq.negative_prompt = *a.negative_prompt;
+        if (a.seed)        sreq.seed                = *a.seed;
+        sreq.append_duration_suffix = !a.no_duration_suffix;
+
+        if (a.init_latent) {
+            std::ifstream f(*a.init_latent, std::ios::binary | std::ios::ate);
+            if (!f) { std::fprintf(stderr, "cannot open %s\n", a.init_latent->c_str()); return 1; }
+            const std::streamoff bytes = f.tellg();
+            f.seekg(0);
+            sreq.initial_latent.resize(size_t(bytes) / sizeof(float));
+            f.read(reinterpret_cast<char *>(sreq.initial_latent.data()), bytes);
+        }
+
+        auto result = openmoss::generate_sound_effect(
+            *model, sreq, [](int step, int total) {
+                std::fprintf(stderr, "\r[sfx] step %d/%d", step, total);
+                if (step == total) std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            });
+
+        std::fprintf(stderr,
+                     "[sfx] prompt: \"%s\" (%d tokens, %d latents)\n"
+                     "[sfx] text %.2fs, solve %.2fs, decode %.2fs\n",
+                     result.prompt.c_str(), result.n_prompt_tokens, result.n_latents,
+                     result.text_seconds, result.sample_seconds, result.decode_seconds);
+
+        if (a.dump_latent) {
+            std::ofstream f(*a.dump_latent, std::ios::binary);
+            if (!f) { std::fprintf(stderr, "cannot open %s\n", a.dump_latent->c_str()); return 1; }
+            f.write(reinterpret_cast<const char *>(result.latent.data()),
+                    std::streamsize(result.latent.size() * sizeof(float)));
+            std::fprintf(stderr, "wrote latent (%zu floats) to %s\n",
+                         result.latent.size(), a.dump_latent->c_str());
+        }
+
+        openmoss::write_wav(a.output_path, result.waveform.data(),
+                            int64_t(result.waveform.size()),
+                            result.sampling_rate, /*channels=*/1);
+        std::fprintf(stderr, "wrote %lld samples (%.2fs, 1 ch @ %d Hz) to %s\n",
+                     (long long)result.waveform.size(),
+                     double(result.waveform.size()) / double(result.sampling_rate),
+                     result.sampling_rate, a.output_path.c_str());
+        return 0;
+    }
 
     openmoss::GenerateRequest req;
     // Family defaults first, then the broad --temperature/--top-p/--top-k

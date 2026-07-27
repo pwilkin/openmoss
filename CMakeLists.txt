@@ -45,6 +45,7 @@ add_library(openmoss_core STATIC
     src/codec.cpp
     src/dit.cpp
     src/dac_vae.cpp
+    src/soundeffect.cpp
     src/pipeline.cpp
     src/wav.cpp
 )

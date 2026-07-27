@@ -27,7 +27,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace openmoss {
@@ -152,5 +154,62 @@ private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };
+
+// ───────────────────────────────────────────────────────────────────────────
+// End-to-end generation
+// ───────────────────────────────────────────────────────────────────────────
+
+struct SoundEffectRequest {
+    std::string prompt;
+
+    // Requested duration. Purely textual: it is appended to the prompt and the
+    // DiT always denoises `moss.max_seconds` worth of latent regardless; the
+    // waveform is cropped to this afterwards. Rounded to one decimal, because
+    // the suffix the model was trained on carries exactly one.
+    float seconds = 10.0f;
+
+    int   num_inference_steps = 100;
+    float cfg_scale           = 4.0f;   // 1.0 disables the unconditional branch
+    float sigma_shift         = 5.0f;
+
+    // 0 is a valid seed here (the upstream default), so there is no
+    // "nondeterministic" sentinel — pass a random value for that.
+    uint64_t seed = 0;
+
+    // Upstream only ever uses the empty string, which tokenizes to nothing and
+    // is then hard-zeroed, making the unconditional context exactly zeros. A
+    // non-empty value runs the text encoder for that branch too.
+    std::string negative_prompt;
+
+    bool append_duration_suffix = true;
+
+    // Verification hook: when set, this replaces the seeded noise. Layout is
+    // (in_dim, n_latents), channel-innermost. Lets a caller feed the reference
+    // implementation's initial latent and compare the result directly, without
+    // having to reproduce PyTorch's RNG.
+    std::vector<float> initial_latent;
+};
+
+struct SoundEffectResult {
+    std::vector<float> waveform;        // mono float32 at `sampling_rate`
+    int32_t            sampling_rate = 0;
+    std::string        prompt;          // after formatting and cleaning
+    int32_t            n_prompt_tokens = 0;
+    int32_t            n_latents       = 0;
+
+    // The final latent behind `waveform`, (out_dim, n_latents) channel-innermost.
+    // Kept for the same reason the TTS pipeline keeps its codes: it is the seam
+    // to diff against a reference without comparing audio.
+    std::vector<float> latent;
+
+    double text_seconds = 0.0, sample_seconds = 0.0, decode_seconds = 0.0;
+};
+
+// Invoked after each solver step, with the 1-based step index and the total.
+using SoundEffectProgress = std::function<void(int step, int total)>;
+
+SoundEffectResult generate_sound_effect(Model & model,
+                                        const SoundEffectRequest & req,
+                                        SoundEffectProgress cb = {});
 
 } // namespace openmoss
