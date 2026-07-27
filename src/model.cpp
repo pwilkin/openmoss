@@ -84,6 +84,27 @@ float kv_f32(gguf_context * gctx, const char * key, float fallback) {
     }
 }
 
+// Read an int-typed GGUF array into a vector. Returns empty when the key is
+// absent or is not an array of an integer type.
+std::vector<int32_t> kv_i32_array(gguf_context * gctx, const char * key) {
+    int64_t k = gguf_find_key(gctx, key);
+    if (k < 0 || gguf_get_kv_type(gctx, k) != GGUF_TYPE_ARRAY) return {};
+    const auto elem = gguf_get_arr_type(gctx, k);
+    const size_t n  = gguf_get_arr_n(gctx, k);
+    const void * data = gguf_get_arr_data(gctx, k);
+    std::vector<int32_t> out(n);
+    for (size_t i = 0; i < n; ++i) {
+        switch (elem) {
+            case GGUF_TYPE_UINT32: out[i] = int32_t(static_cast<const uint32_t *>(data)[i]); break;
+            case GGUF_TYPE_INT32:  out[i] =         static_cast<const int32_t  *>(data)[i];  break;
+            case GGUF_TYPE_UINT64: out[i] = int32_t(static_cast<const uint64_t *>(data)[i]); break;
+            case GGUF_TYPE_INT64:  out[i] = int32_t(static_cast<const int64_t  *>(data)[i]); break;
+            default: return {};
+        }
+    }
+    return out;
+}
+
 std::string kv_str(gguf_context * gctx, const char * key, const std::string & fallback) {
     int64_t k = gguf_find_key(gctx, key);
     if (k < 0) return fallback;
@@ -181,6 +202,31 @@ void read_moss_kv(gguf_context * gctx, ModelDims & d, bool & codec_present) {
     d.local_n_inner    = int32_t(kv_u32(gctx, "moss.local.n_inner", uint32_t(d.local_n_inner)));
     d.local_rope_base  = kv_f32(gctx, "moss.local.rope_base", d.local_rope_base);
     d.local_ln_eps     = kv_f32(gctx, "moss.local.ln_eps",    d.local_ln_eps);
+
+    d.dit_dim          = int32_t(kv_u32(gctx, "moss.dit.dim",       uint32_t(d.dit_dim)));
+    d.dit_n_layers     = int32_t(kv_u32(gctx, "moss.dit.n_layers",  uint32_t(d.dit_n_layers)));
+    d.dit_n_heads      = int32_t(kv_u32(gctx, "moss.dit.n_heads",   uint32_t(d.dit_n_heads)));
+    d.dit_ffn_dim      = int32_t(kv_u32(gctx, "moss.dit.ffn_dim",   uint32_t(d.dit_ffn_dim)));
+    d.dit_in_dim       = int32_t(kv_u32(gctx, "moss.dit.in_dim",    uint32_t(d.dit_in_dim)));
+    d.dit_out_dim      = int32_t(kv_u32(gctx, "moss.dit.out_dim",   uint32_t(d.dit_out_dim)));
+    d.dit_text_dim     = int32_t(kv_u32(gctx, "moss.dit.text_dim",  uint32_t(d.dit_text_dim)));
+    d.dit_freq_dim     = int32_t(kv_u32(gctx, "moss.dit.freq_dim",  uint32_t(d.dit_freq_dim)));
+    d.dit_eps          = kv_f32(gctx, "moss.dit.eps",       d.dit_eps);
+    d.dit_rope_base    = kv_f32(gctx, "moss.dit.rope_base", d.dit_rope_base);
+
+    d.sched_shift       = kv_f32(gctx, "moss.sched.shift", d.sched_shift);
+    d.sched_train_steps = int32_t(kv_u32(gctx, "moss.sched.train_steps",
+                                         uint32_t(d.sched_train_steps)));
+
+    d.vae_latent_dim   = int32_t(kv_u32(gctx, "moss.vae.latent_dim", uint32_t(d.vae_latent_dim)));
+    d.vae_hop          = int32_t(kv_u32(gctx, "moss.vae.hop",        uint32_t(d.vae_hop)));
+    {
+        auto rates = kv_i32_array(gctx, "moss.vae.decoder_rates");
+        if (!rates.empty()) d.vae_decoder_rates = std::move(rates);
+    }
+
+    d.text_max_len     = int32_t(kv_u32(gctx, "moss.text.max_len", uint32_t(d.text_max_len)));
+    d.max_seconds      = int32_t(kv_u32(gctx, "moss.max_seconds",  uint32_t(d.max_seconds)));
 
     d.audio_start_token_id          = int32_t(kv_u32(gctx, "moss.token.audio_start", uint32_t(d.audio_start_token_id)));
     d.audio_end_token_id            = int32_t(kv_u32(gctx, "moss.token.audio_end",   uint32_t(d.audio_end_token_id)));
@@ -283,15 +329,17 @@ void collect_moss_names(LoadSpec & spec, bool include_codec) {
 
 const char * arch_name(Arch a) {
     switch (a) {
-        case Arch::TTSDelay: return "moss_tts_delay";
-        case Arch::TTSLocal: return "moss_tts_local";
+        case Arch::TTSDelay:    return "moss_tts_delay";
+        case Arch::TTSLocal:    return "moss_tts_local";
+        case Arch::SoundEffect: return "moss_soundeffect";
     }
     return "unknown";
 }
 
 bool arch_from_name(const std::string & name, Arch & out) {
-    if (name == "moss_tts_delay") { out = Arch::TTSDelay; return true; }
-    if (name == "moss_tts_local") { out = Arch::TTSLocal; return true; }
+    if (name == "moss_tts_delay")   { out = Arch::TTSDelay;    return true; }
+    if (name == "moss_tts_local")   { out = Arch::TTSLocal;    return true; }
+    if (name == "moss_soundeffect") { out = Arch::SoundEffect; return true; }
     return false;
 }
 
@@ -572,6 +620,35 @@ std::unique_ptr<Model> Model::load(const std::string & gguf_path, const LoadOpti
             throw std::runtime_error(
                 "Model::load: arch is moss_tts_local but moss.local_text_head.weight "
                 "is missing from the sidecar; reconvert the model");
+        }
+    }
+
+    // MOSS-SoundEffect carries no audio embeds or heads at all — the sidecar is
+    // the DiT plus the VAE decoder. Fail here rather than deep inside a graph
+    // build if either half is absent.
+    if (self->m_dims.arch == Arch::SoundEffect) {
+        if (self->m_dims.dit_n_layers <= 0 || self->m_dims.dit_dim <= 0) {
+            throw std::runtime_error(
+                "Model::load: arch is moss_soundeffect but the sidecar carries no "
+                "DiT geometry (moss.dit.n_layers); reconvert the model");
+        }
+        if (!self->m_aux->tensors.count("moss.dit.patch.weight")) {
+            throw std::runtime_error(
+                "Model::load: arch is moss_soundeffect but moss.dit.patch.weight is "
+                "missing from the sidecar; reconvert the model");
+        }
+        if (!self->m_aux->tensors.count("moss.vae.dec.in.weight")) {
+            throw std::runtime_error(
+                "Model::load: arch is moss_soundeffect but the VAE decoder is missing "
+                "from the sidecar (moss.vae.dec.in.weight); reconvert the model");
+        }
+        // The DiT's cross-attention consumes the text encoder's hidden state
+        // directly; there is no projection between them, so the widths must agree.
+        if (self->m_dims.dit_text_dim != self->m_dims.hidden_size) {
+            throw std::runtime_error(
+                "Model::load: DiT text_dim (" + std::to_string(self->m_dims.dit_text_dim) +
+                ") != text-encoder hidden size (" + std::to_string(self->m_dims.hidden_size) +
+                "); the backbone GGUF does not match this sidecar");
         }
     }
 

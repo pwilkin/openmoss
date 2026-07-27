@@ -12,3 +12,6 @@ target_link_libraries(moss-codec-roundtrip PRIVATE openmoss_core)
 
 add_executable(moss-local-probe ${CMAKE_CURRENT_SOURCE_DIR}/moss_local_probe.cpp)
 target_link_libraries(moss-local-probe PRIVATE openmoss_core)
+
+add_executable(moss-sfx-probe ${CMAKE_CURRENT_SOURCE_DIR}/moss_sfx_probe.cpp)
+target_link_libraries(moss-sfx-probe PRIVATE openmoss_core)

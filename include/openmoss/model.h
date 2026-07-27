@@ -26,8 +26,11 @@ namespace openmoss {
 // string KV. GGUFs produced before multi-family support carry no such key and
 // are all MOSS-TTS-Delay, so that stays the default.
 enum class Arch {
-    TTSDelay,   // "moss_tts_delay" — 32 codebooks, delay pattern, 24 kHz mono
-    TTSLocal,   // "moss_tts_local" — 12 codebooks, local transformer, 48 kHz stereo
+    TTSDelay,     // "moss_tts_delay" — 32 codebooks, delay pattern, 24 kHz mono
+    TTSLocal,     // "moss_tts_local" — 12 codebooks, local transformer, 48 kHz stereo
+    SoundEffect,  // "moss_soundeffect" — not autoregressive: a Wan-style DiT sampled
+                  // with flow matching, decoded by a continuous DAC VAE. The
+                  // "backbone" is a plain Qwen3-1.7B used only as a text encoder.
 };
 
 const char * arch_name(Arch a);
@@ -59,6 +62,37 @@ struct ModelDims {
     int32_t local_n_inner     = 0;
     float   local_rope_base   = 1000000.0f;
     float   local_ln_eps      = 1e-6f;
+
+    // ── Arch::SoundEffect only; all zero/default when unused ──────────────
+    //
+    // The DiT (WanAudioModel). `dit_in_dim` == `dit_out_dim` == the VAE latent
+    // width, since the model predicts a velocity in latent space.
+    int32_t dit_dim           = 0;      // 1536
+    int32_t dit_n_layers      = 0;      // 30
+    int32_t dit_n_heads       = 0;      // 12  → head_dim 128
+    int32_t dit_ffn_dim       = 0;      // 8960
+    int32_t dit_in_dim        = 0;      // 128
+    int32_t dit_out_dim       = 0;      // 128
+    int32_t dit_text_dim      = 0;      // 2048 = the Qwen3-1.7B hidden size
+    int32_t dit_freq_dim      = 0;      // 256, width of the sinusoidal time code
+    float   dit_eps           = 1e-6f;  // shared by every LayerNorm and RMSNorm
+    float   dit_rope_base     = 10000.0f;
+
+    // Flow-match scheduler.
+    float   sched_shift       = 5.0f;
+    int32_t sched_train_steps = 1000;
+
+    // DAC VAE decoder. `vae_hop` is the product of `vae_decoder_rates`.
+    int32_t vae_latent_dim    = 0;      // 128
+    int32_t vae_hop           = 0;      // 960 → 50 latent frames/s at 48 kHz
+    std::vector<int32_t> vae_decoder_rates;   // {8, 5, 4, 3, 2}
+
+    // Text conditioning is a fixed-width window: the prompt is right-padded to
+    // `text_max_len` slots and the rows past the real length are zeroed.
+    int32_t text_max_len      = 0;      // 512
+    // The DiT always denoises this many seconds of latent regardless of the
+    // requested duration; the waveform is cropped afterwards.
+    int32_t max_seconds       = 0;      // 30
 
     // Special token ids in the Qwen3 vocab — populated from GGUF metadata.
     int32_t pad_token_id                  = 151643;

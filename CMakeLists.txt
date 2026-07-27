@@ -43,6 +43,7 @@ add_library(openmoss_core STATIC
     src/frame_decoder.cpp
     src/local_transformer.cpp
     src/codec.cpp
+    src/dit.cpp
     src/pipeline.cpp
     src/wav.cpp
 )

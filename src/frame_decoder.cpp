@@ -16,6 +16,7 @@ std::unique_ptr<IFrameDecoder> make_frame_decoder(
     switch (model.dims().arch) {
         case Arch::TTSDelay: return make_delay_frame_decoder(model, prompt_rows);
         case Arch::TTSLocal: return make_local_frame_decoder(model, prompt_rows);
+        case Arch::SoundEffect: break;   // emits no codes; see soundeffect.h
     }
     throw std::runtime_error(std::string("make_frame_decoder: unhandled architecture ")
                              + arch_name(model.dims().arch));

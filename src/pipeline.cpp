@@ -354,6 +354,13 @@ GenerateResult generate(Model & model,
                                            T_ref > 0 ? &ref_codes : nullptr, T_ref,
                                            prompt_len);
             break;
+        case Arch::SoundEffect:
+            // Not autoregressive: there is no prompt grid and no frame decoder.
+            // It is sampled by a flow-matching solver instead — see
+            // openmoss/soundeffect.h.
+            throw std::runtime_error(
+                "generate(): moss_soundeffect is not an autoregressive model; "
+                "use the flow-matching entry point instead");
     }
     std::fprintf(stderr, "[generate] prompt_len = %d tokens\n", prompt_len);
 
