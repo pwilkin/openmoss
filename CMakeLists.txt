@@ -44,6 +44,7 @@ add_library(openmoss_core STATIC
     src/local_transformer.cpp
     src/codec.cpp
     src/dit.cpp
+    src/dac_vae.cpp
     src/pipeline.cpp
     src/wav.cpp
 )

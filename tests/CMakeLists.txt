@@ -15,3 +15,6 @@ target_link_libraries(moss-local-probe PRIVATE openmoss_core)
 
 add_executable(moss-sfx-probe ${CMAKE_CURRENT_SOURCE_DIR}/moss_sfx_probe.cpp)
 target_link_libraries(moss-sfx-probe PRIVATE openmoss_core)
+
+add_executable(moss-sfx-vae-probe ${CMAKE_CURRENT_SOURCE_DIR}/moss_sfx_vae_probe.cpp)
+target_link_libraries(moss-sfx-vae-probe PRIVATE openmoss_core)

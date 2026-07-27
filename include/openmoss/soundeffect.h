@@ -99,4 +99,58 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
+// ───────────────────────────────────────────────────────────────────────────
+// DAC VAE decoder
+// ───────────────────────────────────────────────────────────────────────────
+
+// latent → waveform. `continuous: true` upstream, so there is no quantizer and
+// no codebooks: a kernel-1 post-quant conv, an input conv, five upsampling
+// blocks (Snake → transposed conv → three dilated residual units) and a final
+// Snake + conv + tanh. Total upsample 960, i.e. 50 latent frames per second at
+// 48 kHz, mono.
+//
+// The decoder is one long convolution stack, so it is chunked along time with
+// an overlap wider than its receptive field: the last block alone would
+// otherwise need hundreds of megabytes per temporary at full length.
+// Intermediates to copy back, for probes and tests. Every buffer is
+// (time, channels) with time innermost — which is also how PyTorch lays out
+// [batch, channels, time], so reference dumps compare byte-for-byte with no
+// transpose. Taps require the whole decode to fit in one chunk.
+struct DacTaps {
+    float * post_quant = nullptr;   // (T, latent_dim)
+    float * dec_in     = nullptr;   // (T, channels)
+    // All three describe block `blk_index` (0-based): after its Snake and
+    // transposed convolution, after its first residual unit, and its result.
+    // The first isolates the transposed conv's crop convention, which is the
+    // most error-prone part of the port.
+    float * blk_up     = nullptr;
+    float * blk_res0   = nullptr;
+    float * blk_out    = nullptr;
+    int     blk_index  = -1;
+};
+
+class DacDecoder {
+public:
+    explicit DacDecoder(Model & owner);
+    ~DacDecoder();
+
+    DacDecoder(const DacDecoder &)             = delete;
+    DacDecoder & operator=(const DacDecoder &) = delete;
+
+    // latent: (latent_dim, n_frames) float32, channel-innermost — the same
+    //         layout DiTGraph::forward emits.
+    // returns n_frames * hop mono float32 samples.
+    std::vector<float> decode(const float * latent, int64_t n_frames,
+                              const DacTaps & taps = {});
+
+    // Latent frames decoded per graph. Larger is fewer graph builds and more
+    // peak memory; the default is tuned for roughly half a gigabyte of
+    // temporaries. Overlap is added on top and trimmed away.
+    void set_chunk_frames(int32_t n);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
 } // namespace openmoss
