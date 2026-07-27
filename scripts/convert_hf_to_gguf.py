@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-Convert MOSS-TTS-Delay (+ MOSS-Audio-Tokenizer) from HuggingFace safetensors
-into a single GGUF file consumable by openmoss-ggml.
+Convert a MOSS TTS model (+ its MOSS-Audio-Tokenizer) from HuggingFace
+safetensors into GGUF files consumable by openmoss-ggml.
+
+Supported families (auto-detected from config.json's ``model_type``, or forced
+with ``--arch``):
+
+    moss_tts_delay   MOSS-TTS / MOSS-TTS-v1.5 / MOSS-VoiceGenerator
+                     Qwen3 backbone, 32 RVQ codebooks scheduled with a delay
+                     pattern, MOSS-Audio-Tokenizer v1 (24 kHz mono).
+
+    moss_tts_local   MOSS-TTS-Local-Transformer-v1.5
+                     Qwen3-4B backbone, 12 RVQ codebooks emitted per frame by a
+                     1-layer local ("depth") transformer, MOSS-Audio-Tokenizer
+                     v2 (48 kHz stereo).
 
 Layout produced
 ---------------
@@ -99,7 +111,7 @@ log = logging.getLogger("moss-convert")
 # Backbone extraction (MossTTSDelay → Qwen3)
 # ────────────────────────────────────────────────────────────────────────────
 
-def remap_backbone_name(name: str) -> str | None:
+def remap_backbone_delay(name: str) -> str | None:
     """MossTTSDelay tensor name → Qwen3ForCausalLM convention. Returns None
     when the tensor is not a backbone tensor.
     """
@@ -110,6 +122,20 @@ def remap_backbone_name(name: str) -> str | None:
         return "model." + name[len("language_model."):]
     if name == "lm_heads.0.weight":
         return "lm_head.weight"
+    return None
+
+
+def remap_backbone_local(name: str) -> str | None:
+    """MossTTSLocal tensor name → Qwen3ForCausalLM convention.
+
+    `text_lm_head.weight` is deliberately dropped. MossTTSLocalModel.tie_weights
+    binds it to `transformer.embed_tokens.weight` (and the two blobs are
+    byte-identical in the checkpoint), while the Qwen3 config carries
+    tie_word_embeddings=true — so llama.cpp reuses token_embd as the output
+    projection and shipping the duplicate would waste 389 M params.
+    """
+    if name.startswith("transformer."):
+        return "model." + name[len("transformer."):]
     return None
 
 
@@ -280,16 +306,12 @@ def _save_safetensors_torchfree(tensors: dict, path: Path) -> None:
             f.write(blob)
 
 
-def extract_qwen3_backbone(moss_dir: Path, out_dir: Path) -> dict:
-    """Materialise the language_model.* + lm_heads.0 part of MossTTSDelay
-    into ``out_dir`` as a self-contained Qwen3ForCausalLM checkpoint.
-
-    Returns the moss config dict.
+def extract_qwen3_backbone(moss_dir: Path, out_dir: Path,
+                            fam: "Family", moss_config: dict) -> None:
+    """Materialise the backbone part of a MOSS checkpoint into ``out_dir`` as a
+    self-contained Qwen3ForCausalLM checkpoint.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    with (moss_dir / "config.json").open() as f:
-        moss_config = json.load(f)
 
     weight_map = load_safetensors_index(moss_dir)
     shard_to_tensors: dict[str, list[str]] = defaultdict(list)
@@ -322,7 +344,7 @@ def extract_qwen3_backbone(moss_dir: Path, out_dir: Path) -> dict:
         log.info("scanning %s", shard)
         with STShard(moss_dir / shard) as sf:
             for tname in sorted(shard_to_tensors[shard]):
-                qwen_name = remap_backbone_name(tname)
+                qwen_name = fam.remap_backbone(tname)
                 if qwen_name is None:
                     continue
                 blob, dtype, shape = sf.read_raw(tname)
@@ -361,7 +383,14 @@ def extract_qwen3_backbone(moss_dir: Path, out_dir: Path) -> dict:
                        "weight_map": new_weight_map}, f, indent=2, sort_keys=True)
 
     # Qwen3 config.
-    lang = dict(moss_config["language_config"])
+    lang = None
+    for key in fam.backbone_config_keys:
+        if key in moss_config:
+            lang = dict(moss_config[key])
+            break
+    if lang is None:
+        raise RuntimeError(
+            f"{fam.arch}: none of {fam.backbone_config_keys} present in config.json")
     lang.pop("_name_or_path", None)
     lang["architectures"] = ["Qwen3ForCausalLM"]
     lang["model_type"] = "qwen3"
@@ -376,8 +405,6 @@ def extract_qwen3_backbone(moss_dir: Path, out_dir: Path) -> dict:
         src = moss_dir / fn
         if src.exists():
             shutil.copy2(src, out_dir / fn)
-
-    return moss_config
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -416,13 +443,17 @@ def numpy_dtype_for(out_dtype: str):
     }[out_dtype]
 
 
-def collect_audio_extras(moss_dir: Path, n_vq: int):
-    """Yield (gguf_tensor_name, np.ndarray[f16]) for the audio embeddings + heads."""
-    weight_map = load_safetensors_index(moss_dir)
+def _shards_by_name(model_dir: Path) -> dict[str, list[str]]:
+    weight_map = load_safetensors_index(model_dir)
     by_shard: dict[str, list[str]] = defaultdict(list)
     for tname, shard in weight_map.items():
         by_shard[shard].append(tname)
+    return by_shard
 
+
+def collect_audio_extras_delay(moss_dir: Path, cfg: dict):
+    """Yield (gguf_tensor_name, np.ndarray[f16]) for the audio embeddings + heads."""
+    by_shard = _shards_by_name(moss_dir)
     for shard in sorted(by_shard):
         with STShard(moss_dir / shard) as sf:
             for tname in sorted(by_shard[shard]):
@@ -436,6 +467,55 @@ def collect_audio_extras(moss_dir: Path, n_vq: int):
                     yield f"moss.audio_head.{idx-1}.weight", sf.get_f16(tname)
 
 
+def collect_audio_extras_local(moss_dir: Path, cfg: dict):
+    """Yield (gguf_tensor_name, np.ndarray[f16]) for MOSS-TTS-Local.
+
+    Three differences from the delay family:
+
+    * `audio_lm_heads.{i}` is dropped — tie_weights() binds it to
+      `audio_embeddings.{i}`, and the blobs are byte-identical. The C++ side
+      uses the embedding table as the head matrix (viewing the first
+      audio_vocab_size rows).
+    * Each embedding table gains one all-zero row at index `audio_pad_code`.
+      Upstream masks the pad code out of the summed input embedding
+      (`embedding(safe_ids) * valid_mask`); an explicit zero row reproduces
+      that with a plain get_rows and no branch in the graph.
+    * The 1-layer local ("depth") transformer and the 2-way stop head ship as
+      `moss.local.*` / `moss.local_text_head.weight`. The stop head is
+      independently trained — it is NOT a slice of text_lm_head — so it must
+      be shipped even though everything else tied is dropped.
+    """
+    audio_vocab = int(cfg.get("audio_vocab_size", 1024))
+    pad_code    = int(cfg.get("audio_pad_code", audio_vocab))
+    if pad_code != audio_vocab:
+        raise RuntimeError(
+            f"moss_tts_local: expected audio_pad_code == audio_vocab_size, got "
+            f"{pad_code} != {audio_vocab}; the zero-pad-row trick assumes the pad "
+            f"code sits immediately after the codebook entries")
+
+    by_shard = _shards_by_name(moss_dir)
+    for shard in sorted(by_shard):
+        with STShard(moss_dir / shard) as sf:
+            for tname in sorted(by_shard[shard]):
+                if tname.startswith("audio_embeddings.") and tname.endswith(".weight"):
+                    idx = int(tname.split(".")[1])
+                    arr = sf.get_f16(tname)          # (audio_vocab, hidden)
+                    if arr.shape[0] != audio_vocab:
+                        raise RuntimeError(
+                            f"{tname}: expected {audio_vocab} rows, got {arr.shape[0]}")
+                    padded = np.zeros((audio_vocab + 1, arr.shape[1]), dtype=np.float16)
+                    padded[:audio_vocab] = arr
+                    yield f"moss.audio_embed.{idx}.weight", padded
+                elif tname.startswith("audio_lm_heads."):
+                    continue                          # tied to audio_embeddings
+                elif tname == "text_lm_head.weight":
+                    continue                          # tied to transformer.embed_tokens
+                elif tname.startswith("local_transformer."):
+                    yield "moss.local." + tname[len("local_transformer."):], sf.get_f16(tname)
+                elif tname == "local_text_lm_head.weight":
+                    yield "moss.local_text_head.weight", sf.get_f16(tname)
+
+
 _CODEC_RENAMES = (
     # (substring, replacement) — applied in order, repeatedly until stable.
     # GGUF tensor names are capped at 64 bytes by the C reader, so the upstream
@@ -444,6 +524,21 @@ _CODEC_RENAMES = (
     ("parametrizations.weight.original0", "wp0"),
     ("parametrizations.weight.original1", "wp1"),
     ("transformer.layers",                "tr.l"),
+
+    # MOSS-Audio-Tokenizer v2 renamed three modules relative to v1. Mapping them
+    # back onto v1's GGUF names keeps src/codec.cpp's resolvers name-agnostic —
+    # only the stage tables differ between codec generations.
+    #
+    # The plural forms MUST come first: "self_attn.in_proj" is a prefix of
+    # "self_attn.in_projs", so applying the singular rule first would mangle v1
+    # into "attn.inp.0s.0".
+    ("self_attn.in_projs",                "attn.inp"),    # v1: ModuleList
+    ("self_attn.out_projs",               "attn.outp"),   # v1: ModuleList
+    ("self_attn.in_proj",                 "attn.inp.0"),  # v2: single Linear
+    ("self_attn.out_proj",                "attn.outp.0"), # v2: single Linear
+    ("ffn.0.weight",                      "linear1.weight"),  # v2 Sequential
+    ("ffn.2.weight",                      "linear2.weight"),  # v2 Sequential
+
     ("encoder",                           "enc"),
     ("decoder",                           "dec"),
     ("self_attn",                         "attn"),
@@ -504,12 +599,72 @@ def collect_codec_tensors(codec_dir: Path):
                 yield short, arr
 
 
+class Family:
+    """Everything that differs between MOSS model families."""
+
+    def __init__(self, arch, backbone_config_keys, remap_backbone, collect_extras,
+                 codec_version, downsample_rate, n_channels, sampling_rate,
+                 audio_start, audio_end, n_vq):
+        self.arch                 = arch
+        self.backbone_config_keys = backbone_config_keys
+        self.remap_backbone       = remap_backbone
+        self.collect_extras       = collect_extras
+        self.codec_version        = codec_version
+        self.downsample_rate      = downsample_rate
+        self.n_channels           = n_channels
+        self.sampling_rate        = sampling_rate
+        self.audio_start          = audio_start
+        self.audio_end            = audio_end
+        self.n_vq                 = n_vq
+
+
+FAMILIES = {
+    "moss_tts_delay": Family(
+        arch="moss_tts_delay",
+        backbone_config_keys=("language_config",),
+        remap_backbone=remap_backbone_delay,
+        collect_extras=collect_audio_extras_delay,
+        codec_version=1, downsample_rate=1920, n_channels=1, sampling_rate=24000,
+        audio_start=151652, audio_end=151653, n_vq=32,
+    ),
+    "moss_tts_local": Family(
+        arch="moss_tts_local",
+        # v1.5 ships qwen3_config and language_config with identical contents;
+        # prefer the explicitly-named one.
+        backbone_config_keys=("qwen3_config", "language_config"),
+        remap_backbone=remap_backbone_local,
+        collect_extras=collect_audio_extras_local,
+        codec_version=2, downsample_rate=3840, n_channels=2, sampling_rate=48000,
+        audio_start=151669, audio_end=151670, n_vq=12,
+    ),
+}
+
+
+def detect_family(moss_config: dict, override: str | None = None) -> Family:
+    if override:
+        if override not in FAMILIES:
+            raise SystemExit(f"--arch {override!r} is not one of {sorted(FAMILIES)}")
+        return FAMILIES[override]
+    mt = str(moss_config.get("model_type", "")).strip()
+    if mt in FAMILIES:
+        return FAMILIES[mt]
+    for a in moss_config.get("architectures", []):
+        if a == "MossTTSLocalModel":
+            return FAMILIES["moss_tts_local"]
+        if a == "MossTTSDelayModel":
+            return FAMILIES["moss_tts_delay"]
+    raise SystemExit(
+        f"cannot determine model family (model_type={mt!r}, "
+        f"architectures={moss_config.get('architectures')}); pass --arch explicitly")
+
+
 def write_moss_sidecar(out_gguf: Path,
                        moss_config: dict, moss_dir: Path,
                        codec_dir: Path | None,
+                       fam: Family,
                        llama_cpp_dir: Path | None = None) -> None:
-    """Write the MOSS extras (audio embeddings, audio heads, optional codec,
-    plus the moss.* KV namespace) into a sidecar GGUF.
+    """Write the MOSS extras (audio embeddings, family-specific heads, optional
+    codec, plus the moss.* KV namespace) into a sidecar GGUF.
 
     The C++ loader opens this file alongside the backbone GGUF.
     """
@@ -519,14 +674,28 @@ def write_moss_sidecar(out_gguf: Path,
             sys.path.insert(0, gguf_py)
     import gguf
 
-    writer = gguf.GGUFWriter(str(out_gguf), "moss_tts_delay")
+    writer = gguf.GGUFWriter(str(out_gguf), fam.arch)
 
     # ── 1. emit MOSS KV ─────────────────────────────────────────────────────
-    n_vq             = int(moss_config.get("n_vq", 32))
+    n_vq             = int(moss_config.get("n_vq", fam.n_vq))
     audio_vocab_size = int(moss_config.get("audio_vocab_size", 1024))
     audio_pad_code   = int(moss_config.get("audio_pad_code", audio_vocab_size))
-    sampling_rate    = int(moss_config.get("sampling_rate", 24000))
-    downsample_rate  = 1920  # codec hop, fixed by upstream
+    sampling_rate    = int(moss_config.get("sampling_rate", fam.sampling_rate))
+    downsample_rate  = fam.downsample_rate
+    n_channels       = fam.n_channels
+
+    # The codec is the authority on hop size / channel count when we have it.
+    if codec_dir is not None and (codec_dir / "config.json").exists():
+        with (codec_dir / "config.json").open() as f:
+            codec_cfg = json.load(f)
+        downsample_rate = int(codec_cfg.get("downsample_rate", downsample_rate))
+        n_channels      = int(codec_cfg.get("number_channels", n_channels))
+        sampling_rate   = int(codec_cfg.get("sampling_rate",
+                              codec_cfg.get("sample_rate", sampling_rate)))
+
+    # Read back by the C++ loader; `general.architecture` (which GGUFWriter also
+    # writes) is the fallback for sidecars produced before this key existed.
+    writer.add_string("moss.architecture", fam.arch)
 
     writer.add_uint32("moss.n_vq", n_vq)
     writer.add_uint32("moss.audio_vocab_size", audio_vocab_size)
@@ -534,30 +703,52 @@ def write_moss_sidecar(out_gguf: Path,
     writer.add_uint32("moss.sampling_rate", sampling_rate)
     writer.add_uint32("moss.downsample_rate", downsample_rate)
     writer.add_float32("moss.frame_rate", float(sampling_rate) / float(downsample_rate))
+    writer.add_uint32("moss.codec.version", fam.codec_version)
+    writer.add_uint32("moss.codec.number_channels", n_channels)
 
     writer.add_uint32("moss.token.audio_start",
-                      int(moss_config.get("audio_start_token_id", 151652)))
+                      int(moss_config.get("audio_start_token_id", fam.audio_start)))
     writer.add_uint32("moss.token.audio_end",
-                      int(moss_config.get("audio_end_token_id", 151653)))
+                      int(moss_config.get("audio_end_token_id", fam.audio_end)))
     writer.add_uint32("moss.token.audio_user_slot",
                       int(moss_config.get("audio_user_slot_token_id", 151654)))
     writer.add_uint32("moss.token.audio_gen_slot",
                       int(moss_config.get("audio_assistant_gen_slot_token_id", 151656)))
-    writer.add_uint32("moss.token.audio_delay_slot",
-                      int(moss_config.get("audio_assistant_delay_slot_token_id", 151662)))
     writer.add_uint32("moss.token.im_start",
                       int(moss_config.get("im_start_token_id", 151644)))
     writer.add_uint32("moss.token.im_end",
                       int(moss_config.get("im_end_token_id", 151645)))
+    writer.add_uint32("moss.token.pad",
+                      int(moss_config.get("pad_token_id", 151643)))
+    if fam.arch == "moss_tts_delay":
+        writer.add_uint32("moss.token.audio_delay_slot",
+                          int(moss_config.get("audio_assistant_delay_slot_token_id", 151662)))
+
+    if fam.arch == "moss_tts_local":
+        gpt2 = moss_config.get("gpt2_config", {})
+        n_layer = int(moss_config.get("local_transformer_layers", gpt2.get("n_layer", 1)))
+        writer.add_uint32("moss.local.n_layer",  n_layer)
+        writer.add_uint32("moss.local.n_embd",   int(gpt2.get("n_embd", 2560)))
+        writer.add_uint32("moss.local.n_head",   int(gpt2.get("n_head", 32)))
+        writer.add_uint32("moss.local.n_inner",  int(gpt2.get("n_inner", 9728)))
+        writer.add_float32("moss.local.rope_base",
+                           float(gpt2.get("rope_base", 1000000.0)))
+        writer.add_float32("moss.local.ln_eps",
+                           float(gpt2.get("layer_norm_epsilon", 1e-6)))
+        mode = str(moss_config.get("local_text_head_mode", "binary"))
+        if mode != "binary":
+            raise RuntimeError(
+                f"moss_tts_local: only local_text_head_mode='binary' is supported, "
+                f"got {mode!r}")
 
     writer.add_bool("moss.codec.present", codec_dir is not None)
 
     # ── 2. add MOSS audio tensors ──────────────────────────────────────────
     audio_count = 0
-    for name, arr in collect_audio_extras(moss_dir, n_vq):
+    for name, arr in fam.collect_extras(moss_dir, moss_config):
         writer.add_tensor(name, arr.astype(np.float16))
         audio_count += 1
-    log.info("added %d MOSS audio tensors", audio_count)
+    log.info("added %d MOSS audio/head tensors", audio_count)
 
     # ── 3. add codec tensors (optional) ────────────────────────────────────
     if codec_dir is not None:
@@ -617,6 +808,14 @@ def main():
                     help="Don't delete the scratch dir after conversion")
     ap.add_argument("--skip-extract", action="store_true",
                     help="If scratch/qwen3_backbone.gguf already exists, skip stages 1 and 2")
+    ap.add_argument("--arch", default=None, choices=sorted(FAMILIES),
+                    help="Override model-family detection (normally taken from "
+                         "config.json's model_type)")
+    ap.add_argument("--sidecar-only", action="store_true",
+                    help="Only (re)write the .extras.gguf sidecar, leaving an "
+                         "existing backbone GGUF at --output alone. Useful for "
+                         "iterating on the codec/extras without redoing the "
+                         "multi-minute backbone conversion.")
     args = ap.parse_args()
 
     out_path = Path(args.output).expanduser().resolve()
@@ -633,34 +832,51 @@ def main():
         scratch = Path(tempfile.mkdtemp(prefix="moss-convert-"))
         cleanup_scratch = not args.keep_scratch
 
+    with (moss_dir / "config.json").open() as f:
+        moss_config = json.load(f)
+    fam = detect_family(moss_config, args.arch)
+    log.info("model family: %s", fam.arch)
+
     try:
         qwen3_dir = scratch / "qwen3_backbone"
         backbone_gguf = scratch / "qwen3_backbone.gguf"
 
-        if args.skip_extract and backbone_gguf.exists():
-            log.info("=== stages 1+2 skipped (using cached %s) ===", backbone_gguf)
-            with (moss_dir / "config.json").open() as f:
-                moss_config = json.load(f)
+        if args.sidecar_only:
+            if not out_path.exists():
+                raise SystemExit(f"--sidecar-only: {out_path} does not exist")
+            log.info("=== stages 1-3a skipped (--sidecar-only) ===")
         else:
-            log.info("=== stage 1: extract Qwen3 backbone ===")
-            moss_config = extract_qwen3_backbone(moss_dir, qwen3_dir)
+            if args.skip_extract and backbone_gguf.exists():
+                log.info("=== stages 1+2 skipped (using cached %s) ===", backbone_gguf)
+            else:
+                log.info("=== stage 1: extract Qwen3 backbone ===")
+                extract_qwen3_backbone(moss_dir, qwen3_dir, fam, moss_config)
 
-            log.info("=== stage 2: convert backbone to GGUF (via llama.cpp) ===")
-            run_llama_cpp_converter(qwen3_dir, backbone_gguf,
-                                    Path(args.llama_cpp_dir), args.backbone_dtype)
+                log.info("=== stage 2: convert backbone to GGUF (via llama.cpp) ===")
+                run_llama_cpp_converter(qwen3_dir, backbone_gguf,
+                                        Path(args.llama_cpp_dir), args.backbone_dtype)
+                # The extracted safetensors are dead weight once the GGUF exists,
+                # and they are the same size as it (8+ GB for a 4B backbone).
+                if not args.keep_scratch:
+                    shutil.rmtree(qwen3_dir, ignore_errors=True)
 
-        # Stage 3a: copy/rename the backbone GGUF into the user's output path
-        # (libllama validates that every tensor in a GGUF is "claimed" by the
-        # model loader, so we can't put unknown moss.* tensors in there — they
-        # live in a sidecar file alongside the backbone).
-        log.info("=== stage 3a: place backbone GGUF at %s ===", out_path)
-        if out_path.resolve() != backbone_gguf.resolve():
-            shutil.copy2(backbone_gguf, out_path)
+            # Stage 3a: place the backbone GGUF at the user's output path
+            # (libllama validates that every tensor in a GGUF is "claimed" by the
+            # model loader, so we can't put unknown moss.* tensors in there — they
+            # live in a sidecar file alongside the backbone).
+            log.info("=== stage 3a: place backbone GGUF at %s ===", out_path)
+            if out_path.resolve() != backbone_gguf.resolve():
+                if cleanup_scratch:
+                    # Scratch is a tempdir we own and will delete anyway; moving
+                    # avoids a second full-size copy sitting on disk.
+                    shutil.move(str(backbone_gguf), str(out_path))
+                else:
+                    shutil.copy2(backbone_gguf, out_path)
 
         sidecar_path = out_path.with_suffix(".extras.gguf")
         log.info("=== stage 3b: write MOSS sidecar → %s ===", sidecar_path)
         write_moss_sidecar(sidecar_path, moss_config, moss_dir, codec_dir,
-                           Path(args.llama_cpp_dir))
+                           fam, Path(args.llama_cpp_dir))
     finally:
         if cleanup_scratch:
             shutil.rmtree(scratch, ignore_errors=True)
