@@ -8,21 +8,31 @@
 // ---
 //   GET  /health                       → "ok\n"  (200)
 //   GET  /info                         → JSON with model dims + load options
+//   GET  /v1/models                    → OpenAI-compatible model list (one entry)
+//   GET  /v1/audio/voices              → voices registry (see below)
 //   GET  /  (and other static paths)   → WebUI (when --webui-dir is set)
-//   POST /v1/audio/speech              → OpenAI-compatible TTS endpoint
-//   POST /tts
-//        Content-Type: application/json
-//        Body: see TtsRequest below.
-//        Response: 200 audio/wav (16-bit PCM @ 24 kHz mono)
-//                   on error: 4xx / 5xx text/plain with the message.
+//   POST /tts                          → native TTS, autoregressive families
+//   POST /sfx                          → native MOSS-SoundEffect
+//   POST /v1/audio/speech              → OpenAI-compatible; dispatches on the
+//                                        loaded model's architecture
 //
-// /tts endpoint request schema (all fields optional except `text`):
+// One model is loaded at startup, so exactly one of /tts and /sfx applies; the
+// other answers 400 with a pointer to the right one. Responses carry the model's
+// own sample rate and channel count (24 kHz mono, 48 kHz stereo, or 48 kHz mono
+// depending on the family) — `response_format` selects "wav" (RIFF) or "pcm"
+// (raw 16-bit little-endian, no container).
+//
+// /tts request schema (all fields optional except `text`):
 //   {
-//     "text":              str,       // required
+//     "text":              str,       // required. May start with "${token:N}"
+//                                     //   as an inline duration hint.
 //     "instruction":       str,
 //     "language":          str,       // "en" | "zh" | …
-//     "tokens":            int,       // duration hint, 1s ≈ 12.5 tokens
+//     "token_count":       int,       // duration hint, 1s ≈ 12.5 tokens.
+//                                     //   Wins over the "${token:N}" prefix.
+//     "tokens":            int,       // legacy alias for token_count
 //     "max_new_tokens":    int,       // default 4096
+//     "response_format":   str,       // "wav" (default) | "pcm"
 //     "reference_wav_b64": str,       // base64 of a WAV file for voice cloning
 //     "sampling": {
 //        "text_temperature": float, "text_top_p": float, "text_top_k": int,
@@ -31,17 +41,39 @@
 //     }
 //   }
 //
+// /sfx request schema (all fields optional except `prompt`):
+//   {
+//     "prompt":            str,       // required ("input"/"text" also accepted)
+//     "seconds":           float,     // default 10.0, capped by the model
+//     "steps":             int,       // default 100; each costs two DiT passes
+//     "cfg_scale":         float,     // default 4.0; 1.0 halves the work
+//     "sigma_shift":       float,     // default 5.0
+//     "negative_prompt":   str,       // default empty, which is what it was trained on
+//     "seed":              uint64,    // 0 is a valid seed, not a sentinel
+//     "response_format":   str        // "wav" (default) | "pcm"
+//   }
+//
 // /v1/audio/speech request schema:
 //   {
-//     "model":             str,       // ignored (model is pre-loaded)
-//     "input":             str,       // required — text to synthesize
-//     "voice":             str,       // optional — mapped to instruction or ignored
-//     "response_format":   str,       // "wav" (default), only WAV is supported
-//     "speed":             float      // optional — 0.25..4.0, maps to token count
+//     "model":             str,       // ignored (the model is pre-loaded)
+//     "input":             str,       // required — text, or the sound description
+//     "voice":             str,       // TTS only — mapped to instruction
+//     "response_format":   str,       // "wav" (default) | "pcm"
+//     "speed":             float,     // TTS only — 0.25..4.0, scales token budget
+//     …                               // sampling keys may also be passed flat
+//                                     //   here, as the cookbooks send them; for
+//                                     //   MOSS-SoundEffect the /sfx solver
+//                                     //   fields are accepted instead
 //   }
+//
+// A note on voices: there is no upstream standard. Every MOSS cookbook passes
+// voice="default", and cloning is driven by reference audio rather than a named
+// voice, so /v1/audio/voices follows the vLLM-Omni shape and reports the single
+// "default" entry (empty for MOSS-SoundEffect, which has no notion of a voice).
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -57,6 +89,7 @@
 #include "openmoss/delay.h"
 #include "openmoss/model.h"
 #include "openmoss/pipeline.h"
+#include "openmoss/soundeffect.h"
 #include "openmoss/wav.h"
 
 using json = nlohmann::json;
@@ -80,6 +113,9 @@ namespace {
         "  --webui-dir DIR        serve a static WebUI from DIR at /\n"
         "                          (default: auto-detect ./webui or <binary>/webui)\n"
         "  --no-webui             disable WebUI auto-detection\n"
+        "\n"
+        "Routes: /health /info /v1/models /v1/audio/voices /v1/audio/speech\n"
+        "        plus /tts (autoregressive families) or /sfx (MOSS-SoundEffect)\n"
     );
     std::exit(code);
 }
@@ -211,6 +247,96 @@ void send_text_error(httplib::Response & rs, int status, const std::string & msg
     rs.set_content(msg + "\n", "text/plain");
 }
 
+// ── response encoding ─────────────────────────────────────────────────────
+//
+// `wav` is a RIFF file; `pcm` is the same samples with no container, which is
+// what a caller streaming straight into an audio device wants. Both carry the
+// model's own rate and channel count — the delay family is 24 kHz mono,
+// MOSS-TTS-Local 48 kHz stereo, MOSS-SoundEffect 48 kHz mono — so neither is
+// hardcoded, and the previous unconditional use of the *mono* encoders wrote a
+// stereo waveform under a 1-channel header.
+struct Encoded {
+    std::vector<uint8_t> bytes;
+    const char *         mime;
+};
+
+Encoded encode_audio(const std::string & fmt, const float * pcm, int64_t n_samples,
+                     int32_t sample_rate, int32_t channels) {
+    if (fmt == "pcm") {
+        std::vector<uint8_t> raw(size_t(n_samples) * 2);
+        for (int64_t i = 0; i < n_samples; ++i) {
+            float v = pcm[i];
+            v = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+            const uint16_t u = uint16_t(int16_t(std::lround(v * 32767.0f)));
+            raw[size_t(i) * 2 + 0] = uint8_t(u & 0xff);
+            raw[size_t(i) * 2 + 1] = uint8_t((u >> 8) & 0xff);
+        }
+        return { std::move(raw), "audio/pcm" };
+    }
+    return { openmoss::encode_wav(pcm, n_samples, sample_rate, channels), "audio/wav" };
+}
+
+// The cookbooks let a caller ask for an approximate audio length inline, as a
+// `${token:N}` prefix on the text. Strip it and return N; 0 when absent.
+int extract_token_prefix(std::string & text) {
+    const std::string open = "${token:";
+    if (text.rfind(open, 0) != 0) return 0;
+    const size_t close = text.find('}', open.size());
+    if (close == std::string::npos) return 0;
+    const std::string digits = text.substr(open.size(), close - open.size());
+    if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
+        return 0;   // not a token count after all; leave the text untouched
+    }
+    const int n = std::atoi(digits.c_str());
+    text.erase(0, close + 1);
+    if (!text.empty() && text.front() == ' ') text.erase(0, 1);
+    return n;
+}
+
+// Pull reference audio out of a request. Two shapes are accepted: the legacy
+// scalar `reference_wav_b64`, and the cookbooks' `references[]` array of
+// {ref_audio, ref_text}.
+//
+// `ref_text` is deliberately *rejected* rather than ignored. Supplying the
+// reference's transcript selects a different prompt layout upstream —
+// continuation mode, where the reference audio goes in the assistant channel
+// behind slot 151656 with no closing audio_end — and the pipeline only builds
+// the user-channel layout today. Accepting the field and dropping it would look
+// like working voice cloning while quietly doing something else.
+//
+// Returns false and fills `err` on a malformed request. `out_b64` is left empty
+// when the request carries no reference at all.
+bool extract_reference(const json & body, std::string & out_b64, std::string & err) {
+    if (body.contains("references")) {
+        const json & refs = body["references"];
+        if (!refs.is_array()) { err = "'references' must be an array"; return false; }
+        if (refs.empty()) return true;
+        if (refs.size() > 1) {
+            err = "only one reference is supported; got " + std::to_string(refs.size());
+            return false;
+        }
+        const json & r = refs[0];
+        if (!r.is_object()) { err = "each entry in 'references' must be an object"; return false; }
+        if (r.contains("ref_text") && r["ref_text"].is_string()
+                                   && !r["ref_text"].get<std::string>().empty()) {
+            err = "ref_text is not implemented: a reference transcript selects "
+                  "continuation mode, which this build does not construct. Omit "
+                  "ref_text to clone from audio alone.";
+            return false;
+        }
+        if (!r.contains("ref_audio") || !r["ref_audio"].is_string()) {
+            err = "'references[0].ref_audio' must be a base64 WAV string";
+            return false;
+        }
+        out_b64 = r["ref_audio"].get<std::string>();
+        return true;
+    }
+    if (body.contains("reference_wav_b64") && body["reference_wav_b64"].is_string()) {
+        out_b64 = body["reference_wav_b64"].get<std::string>();
+    }
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -292,7 +418,9 @@ int main(int argc, char ** argv) {
     svr.Get("/info", [&](const httplib::Request &, httplib::Response & rs) {
         const auto & d = model->dims();
         json info = {
+            {"architecture",      openmoss::arch_name(d.arch)},
             {"sampling_rate",     d.sampling_rate},
+            {"n_channels",        d.n_channels},
             {"n_vq",              d.n_vq},
             {"audio_vocab_size",  d.audio_vocab_size},
             {"hidden_size",       d.hidden_size},
@@ -301,7 +429,136 @@ int main(int argc, char ** argv) {
             {"codec_loaded",      model->codec_loaded()},
             {"requests_served",   uint64_t(n_requests.load())},
         };
+        // MOSS-SoundEffect has no codec and no codebooks; what a caller needs to
+        // know is the solver surface and the fixed duration ceiling.
+        if (d.arch == openmoss::Arch::SoundEffect) {
+            info["max_seconds"]         = d.max_seconds;
+            info["default_steps"]       = 100;
+            info["default_cfg_scale"]   = 4.0;
+            info["default_sigma_shift"] = d.sched_shift;
+            info["latent_frames"]       = int64_t(d.sampling_rate) * d.max_seconds / d.vae_hop;
+        }
         rs.set_content(info.dump(), "application/json");
+    });
+
+    // OpenAI-compatible model list. Only ever one entry: the model is loaded at
+    // startup and cannot be switched at runtime.
+    svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & rs) {
+        json j = {
+            {"object", "list"},
+            {"data", json::array({ json{
+                {"id",       openmoss::arch_name(model->dims().arch)},
+                {"object",   "model"},
+                {"owned_by", "openmoss"},
+                {"created",  0},
+            }})},
+        };
+        rs.set_content(j.dump(), "application/json");
+    });
+
+    // Voices registry. There is no upstream standard for this — every MOSS
+    // cookbook passes voice="default" — so the shape follows the vLLM-Omni
+    // convention, which is the closest thing to one. For the TTS families a
+    // "voice" is really just an instruction string, and cloning is driven by
+    // reference audio rather than a named voice; MOSS-SoundEffect has no notion
+    // of a voice at all and reports an empty list.
+    svr.Get("/v1/audio/voices", [&](const httplib::Request &, httplib::Response & rs) {
+        json voices = json::array();
+        if (model->dims().arch != openmoss::Arch::SoundEffect) {
+            voices.push_back(json{
+                {"id",          "default"},
+                {"name",        "default"},
+                {"description", "the model's own voice; pass reference audio to clone another"},
+            });
+        }
+        rs.set_content(json{{"object", "list"}, {"data", voices}}.dump(),
+                       "application/json");
+    });
+
+    // ── MOSS-SoundEffect ──────────────────────────────────────────────────
+    //
+    // Shared by POST /sfx and by /v1/audio/speech when the loaded model is this
+    // family. Not autoregressive, so none of the TTS sampling knobs apply.
+    auto parse_sfx = [&](const json & body, std::string & err) -> openmoss::SoundEffectRequest {
+        openmoss::SoundEffectRequest req;
+        // /sfx takes "prompt"; /v1/audio/speech takes "input". Accept either.
+        for (const char * k : {"prompt", "input", "text"}) {
+            if (body.contains(k) && body[k].is_string()) { req.prompt = body[k].get<std::string>(); break; }
+        }
+        if (req.prompt.empty()) { err = "missing required field 'prompt' (string)"; return req; }
+        req.seconds             = jget(body, "seconds",             req.seconds);
+        req.num_inference_steps = jget(body, "steps",               req.num_inference_steps);
+        req.cfg_scale           = jget(body, "cfg_scale",           req.cfg_scale);
+        req.sigma_shift         = jget(body, "sigma_shift",         req.sigma_shift);
+        req.negative_prompt     = jget(body, "negative_prompt",     req.negative_prompt);
+        req.seed                = jget(body, "seed",                req.seed);
+        req.append_duration_suffix =
+            jget(body, "append_duration_suffix", req.append_duration_suffix);
+        if (req.num_inference_steps < 1)  err = "steps must be >= 1";
+        if (req.seconds <= 0.0f)          err = "seconds must be > 0";
+        return req;
+    };
+
+    auto handle_sfx = [&](const json & body, const std::string & fmt,
+                          uint64_t req_id, httplib::Response & rs) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string err;
+        openmoss::SoundEffectRequest req = parse_sfx(body, err);
+        if (!err.empty()) return send_text_error(rs, 400, err);
+
+        openmoss::SoundEffectResult result;
+        try {
+            std::lock_guard<std::mutex> g(gen_mu);
+            std::fprintf(stderr,
+                "[server] req#%llu /sfx prompt=%zu chars seconds=%.1f steps=%d cfg=%.2f\n",
+                (unsigned long long)req_id, req.prompt.size(),
+                double(req.seconds), req.num_inference_steps, double(req.cfg_scale));
+            result = openmoss::generate_sound_effect(*model, req);
+        } catch (const std::exception & e) {
+            return send_text_error(rs, 500, std::string("generation failed: ") + e.what());
+        }
+        if (result.waveform.empty()) {
+            return send_text_error(rs, 500, "generation produced no audio");
+        }
+
+        auto enc = encode_audio(fmt, result.waveform.data(),
+                                int64_t(result.waveform.size()),
+                                result.sampling_rate, /*channels=*/1);
+        const std::chrono::duration<double> total_s = std::chrono::steady_clock::now() - t0;
+        std::fprintf(stderr,
+            "[server] req#%llu ok: %zu samples (%.2fs audio) — text %.2fs solve %.2fs decode %.2fs total %.2fs\n",
+            (unsigned long long)req_id, result.waveform.size(),
+            result.waveform.size() / double(result.sampling_rate),
+            result.text_seconds, result.sample_seconds, result.decode_seconds,
+            total_s.count());
+
+        rs.set_header("X-MOSS-Prompt", result.prompt);
+        rs.set_header("X-MOSS-Latent-Frames", std::to_string(result.n_latents));
+        rs.set_header("X-MOSS-Solve-Seconds", std::to_string(result.sample_seconds));
+        rs.set_header("X-MOSS-Decode-Seconds", std::to_string(result.decode_seconds));
+        rs.set_content(reinterpret_cast<const char *>(enc.bytes.data()),
+                       enc.bytes.size(), enc.mime);
+    };
+
+    svr.Post("/sfx", [&](const httplib::Request & rq, httplib::Response & rs) {
+        const uint64_t req_id = ++n_requests;
+        if (model->dims().arch != openmoss::Arch::SoundEffect) {
+            return send_text_error(rs, 400,
+                std::string("/sfx requires a moss_soundeffect model; this server loaded ")
+                + openmoss::arch_name(model->dims().arch) + " — use /tts");
+        }
+        json body;
+        try { body = json::parse(rq.body); }
+        catch (const std::exception & e) {
+            return send_text_error(rs, 400, std::string("invalid JSON body: ") + e.what());
+        }
+        if (!body.is_object()) return send_text_error(rs, 400, "JSON body must be an object");
+        std::string fmt = jget(body, "response_format", std::string("wav"));
+        if (fmt != "wav" && fmt != "pcm") {
+            return send_text_error(rs, 400,
+                "unsupported response_format '" + fmt + "'; use 'wav' or 'pcm'");
+        }
+        handle_sfx(body, fmt, req_id, rs);
     });
 
     svr.Post("/tts", [&](const httplib::Request & rq, httplib::Response & rs) {
@@ -316,11 +573,30 @@ int main(int argc, char ** argv) {
                 std::string("invalid JSON body: ") + e.what());
         }
         if (!body.is_object()) return send_text_error(rs, 400, "JSON body must be an object");
+        // One endpoint per family: /tts drives the autoregressive path, which
+        // MOSS-SoundEffect has no equivalent of.
+        if (model->dims().arch == openmoss::Arch::SoundEffect) {
+            return send_text_error(rs, 400,
+                "this server loaded moss_soundeffect, which is not autoregressive — use /sfx");
+        }
         if (!body.contains("text") || !body["text"].is_string())
             return send_text_error(rs, 400, "missing required field 'text' (string)");
 
+        std::string fmt = jget(body, "response_format", std::string("wav"));
+        if (fmt != "wav" && fmt != "pcm") {
+            return send_text_error(rs, 400,
+                "unsupported response_format '" + fmt + "'; use 'wav' or 'pcm'");
+        }
+
         openmoss::GenerateRequest req;
         req.text          = body["text"].get<std::string>();
+        // Duration hint, either as a field or as the cookbooks' inline prefix.
+        // An explicit field wins over the prefix.
+        if (const int inline_n = extract_token_prefix(req.text); inline_n > 0) {
+            req.tokens = inline_n;
+        }
+        if (body.contains("token_count") && body["token_count"].is_number_integer())
+            req.tokens      = body["token_count"].get<int>();
         if (body.contains("instruction") && body["instruction"].is_string())
             req.instruction = body["instruction"].get<std::string>();
         if (body.contains("language") && body["language"].is_string())
@@ -334,15 +610,27 @@ int main(int argc, char ** argv) {
                                              default_sampling(model->dims().n_vq));
         finalize_voicegen_request(req, model->dims());
 
-        if (body.contains("reference_wav_b64") && body["reference_wav_b64"].is_string()) {
-            try {
-                auto wav_bytes = b64_decode(body["reference_wav_b64"].get<std::string>());
-                req.reference_wav = openmoss::decode_wav_mono(
-                    wav_bytes.data(), wav_bytes.size(),
-                    model->dims().sampling_rate);
-            } catch (const std::exception & e) {
-                return send_text_error(rs, 400,
-                    std::string("could not decode reference_wav_b64: ") + e.what());
+        {
+            std::string ref_b64, ref_err;
+            if (!extract_reference(body, ref_b64, ref_err)) {
+                return send_text_error(rs, 400, ref_err);
+            }
+            if (!ref_b64.empty()) {
+                try {
+                    auto wav_bytes = b64_decode(ref_b64);
+                    // Channel-aware for the same reason the encoder is: the codec
+                    // for MOSS-TTS-Local expects a 2-channel interleaved
+                    // reference, and decode_wav adapts the file (downmix, or
+                    // duplicate a mono one) rather than silently handing over
+                    // half a signal.
+                    req.reference_wav = openmoss::decode_wav(
+                        wav_bytes.data(), wav_bytes.size(),
+                        model->dims().sampling_rate,
+                        model->dims().n_channels);
+                } catch (const std::exception & e) {
+                    return send_text_error(rs, 400,
+                        std::string("could not decode reference audio: ") + e.what());
+                }
             }
         }
 
@@ -366,9 +654,12 @@ int main(int argc, char ** argv) {
                 "generation produced no audio (codec missing or model emitted EOS too early)");
         }
 
-        auto wav_bytes = openmoss::encode_wav_mono(
-            result.waveform.data(), int64_t(result.waveform.size()),
-            model->dims().sampling_rate);
+        // Channel-aware: MOSS-TTS-Local is 48 kHz *stereo*, and the mono
+        // encoder used to write its interleaved waveform under a 1-channel
+        // header, halving the playback rate.
+        auto enc = encode_audio(fmt, result.waveform.data(),
+                                int64_t(result.waveform.size()),
+                                model->dims().sampling_rate, result.n_channels);
 
         const std::chrono::duration<double> total_s =
             std::chrono::steady_clock::now() - t0;
@@ -376,7 +667,8 @@ int main(int argc, char ** argv) {
             "[server] req#%llu ok: %zu samples (%.2fs audio) — prefill %.2fs gen %.2fs decode %.2fs total %.2fs\n",
             (unsigned long long)req_id,
             result.waveform.size(),
-            result.waveform.size() / double(model->dims().sampling_rate),
+            result.waveform.size()
+                / double(model->dims().sampling_rate) / double(result.n_channels),
             result.prefill_seconds,
             result.generate_seconds,
             result.decode_seconds,
@@ -387,8 +679,9 @@ int main(int argc, char ** argv) {
                        std::to_string(result.generate_seconds));
         rs.set_header("X-MOSS-Decode-Seconds",
                        std::to_string(result.decode_seconds));
-        rs.set_content(reinterpret_cast<const char *>(wav_bytes.data()),
-                        wav_bytes.size(), "audio/wav");
+        rs.set_header("X-MOSS-Channels", std::to_string(result.n_channels));
+        rs.set_content(reinterpret_cast<const char *>(enc.bytes.data()),
+                        enc.bytes.size(), enc.mime);
     });
 
     svr.Post("/v1/audio/speech", [&](const httplib::Request & rq, httplib::Response & rs) {
@@ -406,16 +699,27 @@ int main(int argc, char ** argv) {
         if (!body.contains("input") || !body["input"].is_string())
             return send_text_error(rs, 400, "missing required field 'input' (string)");
 
-        // Check response_format — only "wav" is supported.
         std::string fmt = jget(body, "response_format", std::string("wav"));
-        if (fmt != "wav") {
+        if (fmt != "wav" && fmt != "pcm") {
             return send_text_error(rs, 400,
-                "unsupported response_format '" + fmt + "'; only 'wav' is supported");
+                "unsupported response_format '" + fmt + "'; use 'wav' or 'pcm'");
+        }
+
+        // MOSS-SoundEffect answers this route too, treating `input` as the sound
+        // description. Its solver options are accepted as extensions; `voice` and
+        // `speed` have no meaning for it and are ignored.
+        if (model->dims().arch == openmoss::Arch::SoundEffect) {
+            return handle_sfx(body, fmt, req_id, rs);
         }
 
         // Translate OpenAI fields → native MOSS GenerateRequest.
         openmoss::GenerateRequest req;
         req.text = body["input"].get<std::string>();
+        if (const int inline_n = extract_token_prefix(req.text); inline_n > 0) {
+            req.tokens = inline_n;
+        }
+        if (body.contains("token_count") && body["token_count"].is_number_integer())
+            req.tokens = body["token_count"].get<int>();
 
         // "voice" → instruction hint (e.g. "alloy", "echo", …).
         if (body.contains("voice") && body["voice"].is_string()) {
@@ -423,15 +727,27 @@ int main(int argc, char ** argv) {
         }
 
         // Voice cloning: a base64 WAV reference the model continues in.
-        if (body.contains("reference_wav_b64") && body["reference_wav_b64"].is_string()) {
-            try {
-                auto wav_bytes = b64_decode(body["reference_wav_b64"].get<std::string>());
-                req.reference_wav = openmoss::decode_wav_mono(
-                    wav_bytes.data(), wav_bytes.size(),
-                    model->dims().sampling_rate);
-            } catch (const std::exception & e) {
-                return send_text_error(rs, 400,
-                    std::string("could not decode reference_wav_b64: ") + e.what());
+        {
+            std::string ref_b64, ref_err;
+            if (!extract_reference(body, ref_b64, ref_err)) {
+                return send_text_error(rs, 400, ref_err);
+            }
+            if (!ref_b64.empty()) {
+                try {
+                    auto wav_bytes = b64_decode(ref_b64);
+                    // Channel-aware for the same reason the encoder is: the codec
+                    // for MOSS-TTS-Local expects a 2-channel interleaved
+                    // reference, and decode_wav adapts the file (downmix, or
+                    // duplicate a mono one) rather than silently handing over
+                    // half a signal.
+                    req.reference_wav = openmoss::decode_wav(
+                        wav_bytes.data(), wav_bytes.size(),
+                        model->dims().sampling_rate,
+                        model->dims().n_channels);
+                } catch (const std::exception & e) {
+                    return send_text_error(rs, 400,
+                        std::string("could not decode reference audio: ") + e.what());
+                }
             }
         }
 
@@ -445,7 +761,12 @@ int main(int argc, char ** argv) {
         }
         // Scale the default token budget by speed (lower speed = fewer tokens = shorter audio).
         req.max_new_tokens = std::max(1, int(4096 / speed));
-        req.sampling       = default_sampling(model->dims().n_vq);
+        // Sampling can arrive nested under "sampling" (our own shape) or
+        // flattened at the top level, which is what the cookbooks send. The
+        // nested form is applied first so explicit flat keys win.
+        req.sampling       = parse_sampling(body.value("sampling", json::object()),
+                                            default_sampling(model->dims().n_vq));
+        req.sampling       = parse_sampling(body, req.sampling);
         finalize_voicegen_request(req, model->dims());
 
         openmoss::GenerateResult result;
@@ -469,9 +790,9 @@ int main(int argc, char ** argv) {
                 "generation produced no audio (codec missing or model emitted EOS too early)");
         }
 
-        auto wav_bytes = openmoss::encode_wav_mono(
-            result.waveform.data(), int64_t(result.waveform.size()),
-            model->dims().sampling_rate);
+        auto enc = encode_audio(fmt, result.waveform.data(),
+                                int64_t(result.waveform.size()),
+                                model->dims().sampling_rate, result.n_channels);
 
         const std::chrono::duration<double> total_s =
             std::chrono::steady_clock::now() - t0;
@@ -490,8 +811,9 @@ int main(int argc, char ** argv) {
                        std::to_string(result.generate_seconds));
         rs.set_header("X-MOSS-Decode-Seconds",
                        std::to_string(result.decode_seconds));
-        rs.set_content(reinterpret_cast<const char *>(wav_bytes.data()),
-                        wav_bytes.size(), "audio/wav");
+        rs.set_header("X-MOSS-Channels", std::to_string(result.n_channels));
+        rs.set_content(reinterpret_cast<const char *>(enc.bytes.data()),
+                        enc.bytes.size(), enc.mime);
     });
 
     svr.set_logger([](const httplib::Request & rq, const httplib::Response & rs) {
