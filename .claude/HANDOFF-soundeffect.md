@@ -4,18 +4,21 @@ Branch: `feat/moss-tts-local` (off `main`). Everything below is committed.
 
 ## TL;DR
 
-Two of the three model families are done. **MOSS-TTS-Local-Transformer-v1.5 is
-finished, verified and published**; **MOSS-SoundEffect-v2.0 has its converter
-done** and needs three GGML pieces written: the DiT graph, the DAC VAE decoder,
-and the flow-matching sampler.
+**All three GGML pieces are written and verified against the PyTorch reference.**
+MOSS-SoundEffect generates end to end from the CLI, and an optional Q8_0 sidecar
+halves its size with no measurable cost to the output.
 
-Everything structural has already been verified against the real checkpoints —
-none of it needs re-deriving. Take the numbers in this document as ground truth
-unless the code disagrees, in which case trust the checkpoint.
+What is left is *shipping* (needs explicit authorisation — it is a public,
+name-attributed upload) and the deferred **Phase 6 server surface**.
 
 ## Commits on this branch
 
 ```
+7cd33b1  feat(convert): optional Q8_0 for the sidecar's projection matrices
+ba8744b  feat(sfx): flow-matching sampler and end-to-end generation
+a056bbb  feat(sfx): DAC VAE decoder
+ddcdb4c  feat(sfx): WanAudioModel DiT graph for MOSS-SoundEffect-v2.0
+92ec1e9  docs: handoff notes for the remaining MOSS-SoundEffect work
 e8f0467  feat(convert): support MOSS-SoundEffect-v2.0
 db7bfe4  feat(cli,tests): sampling flags, code dump, and a depth-transformer probe
 747b3a6  feat(convert): support the moss_tts_local family
@@ -24,8 +27,41 @@ ff26e54  feat(codec): MOSS-Audio-Tokenizer-v2 + chunked sliding-window attention
 c7409a9  feat(wav): channel-aware WAV I/O
 ```
 
-Each was checked to build individually — the history is bisectable. Build with
-`cmake -B build -DGGML_VULKAN=ON && cmake --build build -j`.
+Build with `cmake -B build -DGGML_VULKAN=ON && cmake --build build -j`.
+
+## Running it
+
+```bash
+./build/moss-tts-cli \
+  --model /devel/models/models/openmoss/moss-soundeffect-2.0.gguf \
+  --text "a dog barking twice" --seconds 5 --steps 100 --seed 42 \
+  --vk-f32 --output out.wav
+```
+
+**Use `--vk-f32` on Vulkan.** It sets `GGML_VK_DISABLE_F16`, which stops the
+backend accumulating *libllama's* matmuls in f16. Without it the text encoder
+lands 3.3e-2 from the fp32 reference and the DiT cross-attends to that on all
+~200 forward passes; with it the final latent goes from 1.7e-2 to 1.1e-3,
+correlation 0.999855 to 1.000000. It costs nothing measurable (6.76 s of solve
+against 6.77 s) because the weights stay f16 in memory either way — only shader
+compute precision changes. The graphs in this repo already force f32
+accumulation per node, so this only affects the backbone; the DiT probe is
+bit-identical with and without it.
+
+It is opt-in because the env var is process-global and would silently change the
+two autoregressive families' numerics too. Auto-enabling it for this
+architecture alone means reading `moss.architecture` from the sidecar *before*
+libllama initialises — a deliberate loader reorder, not a one-liner.
+
+`moss-tts-cli` dispatches on `moss.architecture`; the sampling flags do not
+apply to this family. SoundEffect-only flags: `--seconds`, `--steps`,
+`--cfg-scale`, `--sigma-shift`, `--negative-prompt`, `--no-duration-suffix`,
+`--dump-latent`, `--init-latent`.
+
+5 s at the default 100 steps takes ~88 s on a Radeon 8060S: 0.15 s text,
+80 s solve (200 DiT passes), 8 s VAE. Cost is independent of `--seconds`,
+because the DiT always denoises the full 30 s and the waveform is cropped.
+`--cfg-scale 1` halves the solve by skipping the unconditional branch.
 
 ## Files on disk
 
@@ -33,262 +69,215 @@ Each was checked to build individually — the history is bisectable. Build with
 |---|---|
 | HF sources (all three models) | `/devel/models/models/openmoss-src/` |
 | GGUFs | `/devel/models/models/openmoss/` |
-| SoundEffect backbone GGUF | `moss-soundeffect-2.0.gguf` (4.07 GB, Qwen3-1.7B text encoder) |
-| SoundEffect sidecar | `moss-soundeffect-2.0.extras.gguf` (2.98 GB, 825 DiT + 148 VAE tensors) |
+| SoundEffect backbone | `moss-soundeffect-2.0.gguf` (4.07 GB, Qwen3-1.7B text encoder) |
+| SoundEffect sidecar, f16 | `moss-soundeffect-2.0.extras.gguf` (2.98 GB) |
+| SoundEffect sidecar, Q8_0 | `moss-soundeffect-2.0-q8.extras.gguf` (1.67 GB; backbone is a hardlink) |
+| Reference dumps | scratchpad `ref/`, `ref_vae/`, `ref_pipe/`, `ref_f16w/` — **regenerate if gone**, the scripts are next to them |
 | `llama-quantize` | `/devel/tools/llama.cpp/build/bin/llama-quantize` (not built in-tree) |
-| Reference Python sources | scratchpad `se2src/` — may be gone; re-fetch from `github.com/OpenMOSS/MOSS-TTS/moss_soundeffect_v2` |
 
-Published: <https://huggingface.co/ilintar/moss-tts-local-gguf> (MOSS-TTS-Local, Q8).
+## The verification method — read this before touching the numerics
 
-## What is done
+Comparing generated audio is useless here: 100 solver steps amplify any
+numerical difference. Everything was verified at *seams*, feeding both sides
+identical input bytes. Two things had to be established first, and they are what
+make the numbers interpretable.
 
-### Family abstraction (`include/openmoss/frame_decoder.h`, `src/model.cpp`)
+**1. The f16 budget.** Storing weights as f16 costs ~2e-4 relative at every
+seam. Measured by rerunning the fp32 reference with its weights round-tripped
+through f16 (`p.copy_(p.half().float())`). It does *not* accumulate over the 30
+blocks — it is flat end to end. So ~2e-4 is the floor, and anything much above
+it is a bug rather than noise. Do not skip this step; without it, a 25x-too-large
+error looks like a plausible "f16 is lossy" hand-wave.
 
-`moss.architecture` is a string KV read at load, falling back to
-`general.architecture` and then to `moss_tts_delay`, so **GGUFs published before
-this work still load untouched**. `Arch` is an enum on `ModelDims`.
+**2. The head amplifies.** Residual channel 421 grows to ~50x its neighbours by
+the last block, so the head's non-affine LayerNorm collapses every frame onto
+nearly one direction — only ~7e-5 of the normalised energy survives demeaning.
+The DiT output is therefore a per-channel DC offset of ±150 carrying only ~2.5
+std of real signal. **A naive relative error against `dit_out` reads a
+comfortable 1e-3 while the per-frame structure is destroyed.** Compare it
+demeaned. Frame-constant error passes the head at ~0.8x; frame-varying error is
+amplified ~50x.
 
-`IFrameDecoder::step()` takes the raw backbone hidden state, not pre-computed
-audio logits. That is forced by MOSS-TTS-Local: it must sample code *k* before it
-can compute logits for *k+1*, so head invocation belongs to the decoder.
+That framing immediately exposed the one real bug in this work — see the traps
+below.
 
-### MOSS-TTS-Local — complete
+### The probes
 
-Verified four independent ways, all exact: prompt ids vs the reference processor
-(69/69), depth transformer on a synthetic hidden state (12/12), on the
-reference's real hidden state (12/12), and full-pipeline greedy Q8 vs fp32
-reference (12/12). Codec round-trip 0.995 at 5/40/120 s. Gemma 4 E4B transcribed
-three generated samples word-for-word.
+```bash
+# DiT: t, t_mod, ctx_emb, x_patched, blk0 self/cross/out, blk29, dit_out
+./build/moss-sfx-probe   <model.gguf> <scratchpad>/ref [_t16]
 
-### MOSS-SoundEffect converter — complete (`e8f0467`)
-
-Produces both GGUFs. See the commit message for the details; the load-bearing
-ones are repeated under "Traps" below.
-
-## What is left
-
-Tracked as SFX-2 … SFX-5. Roughly in order:
-
-### SFX-2 — WanAudioModel DiT graph
-
-30 blocks, dim 1536, 12 heads, head_dim 128, ffn 8960, eps 1e-6. Per block:
-
-```
-shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
-    = (block.mod[1,6,1536] + t_mod[B,6,1536]).chunk(6, dim=1)
-
-x = x + gate_msa * self_attn( norm1(x)*(1+scale_msa) + shift_msa )
-x = x + cross_attn( norm3(x), context )          # NOTE: no gate here
-x = x + gate_mlp * ffn( norm2(x)*(1+scale_mlp) + shift_mlp )
+# VAE: post_quant, dec_in, blk1 up/res0/out, blk2..5, audio, + a chunking check
+./build/moss-sfx-vae-probe <model.gguf> <scratchpad>/ref_vae [_t40]
 ```
 
-Verified against the reference source:
+Both gate on the f16 budget and print every seam. Env knobs:
+`MOSS_AUX_CPU=1` reruns on the CPU backend, which separates a graph error from a
+backend numerics difference; `MOSS_SEAM_TOL=F` raises the per-seam budget for a
+quantised sidecar.
 
-* `norm1` and `norm2` are `LayerNorm(eps, elementwise_affine=False)` — **no
-  parameters, and absent from the checkpoint**. Only `norm3` is affine, and it
-  is stored on disk as `norm2` (an off-by-one rename in the diffusers export).
-  The converter already maps it to `moss.dit.blk.N.norm3.*`.
-* Self-attention: `q = norm_q(W_q x)` then RoPE; same for k; v is neither
-  normed nor rotated. `norm_q`/`norm_k` are **RMSNorm over the full 1536 axis,
-  not per-head** — apply them before reshaping into heads.
-* RoPE is interleaved-pair → `GGML_ROPE_TYPE_NORMAL` (mode 0), theta 10000,
-  n_dims 128, positions 0..f-1. The reference chunks `freqs_cis` into 3 and
-  concatenates them back, which is an exact identity for `vae_type="dac"`.
-* Cross-attention: no RoPE, **no mask** — all 512 text slots are attended,
-  including padding.
-* FFN is `Linear → GELU(approximate='tanh') → Linear`. ggml's `ggml_gelu` *is*
-  the tanh approximation, so use it, not `ggml_gelu_erf`.
-* `head(x, t)` takes the plain time embedding **`t`, not `t_mod`**, with its own
-  `[1, 2, 1536]` modulation: `shift, scale = (mod + t.unsqueeze(1)).chunk(2)`,
-  index 0 = shift, 1 = scale.
+The VAE probe's chunking check is worth keeping honest: it re-decodes chunked and
+diffs against single-shot, and they agree **bit for bit**, because convolution is
+exactly shift-equivariant when each output's summation order is unchanged. An
+overlap of 12 latent frames already suffices and 2 does not (1.5e-2), so the
+chosen 32 is real margin — verified by temporarily shrinking it.
 
-Time embedding (compute host-side, it is one 256-vector per step):
+### Where things stand
 
-```
-freqs   = 10000 ** (-i/128)  for i in 0..127      # accumulate in float64
-sinusoid = outer(timestep, freqs)
-emb     = cat([cos(sinusoid), sin(sinusoid)])     # COS FIRST, then sin
-t       = t_emb.2( silu( t_emb.1(emb) ) )         # [1536]
-t_mod   = t_proj( silu(t) ).unflatten(6, 1536)    # [6, 1536]
-```
+| seam | f16 sidecar | Q8_0 sidecar | f16 budget |
+|---|---|---|---|
+| DiT `ctx_emb` | 3.1e-4 | 5.3e-3 | 2.0e-4 |
+| DiT `blk29_out` | 4.2e-4 | 2.7e-3 | 1.6e-4 |
+| DiT `dit_out` demeaned | 2.805e-2 | 2.805e-2 | ~1.1e-2 |
+| VAE `audio` | 1.2e-3 | — | — |
+| text conditioning vs fp32 ref | 1.7e-3 with `--vk-f32`, 3.3e-2 without | — | — |
+| final latent vs fp32 ref, 8 steps | **1.07e-3 (corr 1.000000)** with `--vk-f32`; 1.70e-2 (corr 0.999855) without | 2.08e-2 (corr 0.999783) | — |
 
-`time_projection` is `Sequential(SiLU(), Linear(...))` — the SiLU comes first, so
-the stored weight is index `.1`. The converter names it `moss.dit.t_proj.*`.
+For scale on that last row: the same latent shifted by 0.74 s correlates at 0.90,
+and unrelated noise at 0.06. Every configuration here is the same generation.
 
-Patchify is `patch_size=[1]`, i.e. `Conv1d(128, 1536, k=1)` = a per-frame affine
-map; unpatchify is a no-op reshape.
+Note the Q8_0 column: quantisation makes every *seam* 6-10x worse yet leaves the
+demeaned output identical, because weight-rounding error is almost entirely
+frame-constant and the head discards exactly that component. End to end it costs
+1.70e-2 → 2.08e-2, and the 100-step waveform envelope correlates at 0.999994
+with the f16 one.
 
-### SFX-3 — DAC VAE decoder
-
-`continuous=True`: **no quantizer, no codebooks** (verified — zero quantizer keys
-in the checkpoint). Mono. Total upsample 960 → 50 latent frames/s at 48 kHz.
-
-```
-post_quant_conv  Conv1d(128->128, k=1)        # plain, NOT weight-normed
-dec.in           WNConv1d(128->2048, k=7, p=3)
-dec.{1..5}       Snake -> WNConvTranspose1d -> 3x ResidualUnit(dil 1,3,9)
-dec.out.snake    Snake(64)
-dec.out          WNConv1d(64->1, k=7, p=3)
-                 tanh
-```
-
-Per block B=1..5: `(C_in, C_out, K, stride, pad, out_pad)` =
-`(2048,1024,16,8,4,0) (1024,512,10,5,3,1) (512,256,8,4,2,0) (256,128,6,3,2,1)
-(128,64,4,2,1,0)`. `ResidualUnit(dim, d)` is
-`Snake -> WNConv1d(k=7, dilation=d, pad=3d) -> Snake -> WNConv1d(k=1)`, added to
-its input.
-
-Snake, per-channel alpha: `y = x + sin(a*x)^2 / (a + 1e-9)`. The converter ships
-both `alpha` and a precomputed `inv` = `1/(a+1e-9)`, **both f32** (see Traps).
-Emitting exactly `MUL -> SIN -> SQR -> MUL -> ADD` with 2-D x and a separate inv
-tensor may hit llama.cpp's fused Snake CUDA kernel.
-
-**`ggml_conv_transpose_1d` asserts `p0 == 0`, `d0 == 1`, and a 2-D (batch-1)
-input.** Run it unpadded and crop: ggml gives `L = (T-1)s + k`, PyTorch gives
-`L = (T-1)s - 2p + (k-1) + 1 + op`, so crop `p` from the left and `p - op` from
-the right. Worked out per block:
-
-| block | s | k | p | op | ggml L | crop L/R | final L |
-|---|---|---|---|---|---|---|---|
-| 1 | 8 | 16 | 4 | 0 | 12008 | 4 / 4 | 12000 |
-| 2 | 5 | 10 | 3 | 1 | 60005 | 3 / 2 | 60000 |
-| 3 | 4 | 8 | 2 | 0 | 240004 | 2 / 2 | 240000 |
-| 4 | 3 | 6 | 2 | 1 | 720003 | 2 / 1 | 720000 |
-| 5 | 2 | 4 | 1 | 0 | 1440002 | 1 / 1 | 1440000 |
-
-(for the full 30 s / 1500-latent case).
-
-Two memory problems to plan for, both like the codec's mask issue:
-
-1. Block 5 outputs `64 x 1,440,000` fp32 = 368 MB, and each ResidualUnit needs
-   several live temporaries that size. **Chunk along time** with an overlap of
-   at least the receptive field.
-2. `ggml_conv_1d` goes through `ggml_im2col` with `GGML_TYPE_F16` hardcoded. For
-   k=7, IC=64, T=1.44M that buffer is 1.29 GB *and* silently drops activations
-   to fp16 near the final tanh. Prefer `ggml_im2col(..., GGML_TYPE_F32)` +
-   `ggml_mul_mat` by hand, or chunk.
-
-### SFX-4 — flow matching + pipeline wiring
-
-```
-sigmas    = linspace(1, 0, N+1)[:-1]                 # extra_one_step=True
-sigmas    = shift*s / (1 + (shift-1)*s)              # shift = 5.0
-timesteps = sigmas * 1000
-x        += v * (sigma_next - sigma)                 # Euler; last step -> 0
-```
-
-Initial latent is pure `randn` (sigma_0 is exactly 1.0, so no scaling).
-Defaults: `num_inference_steps=100`, `cfg_scale=4.0`, `sigma_shift=5.0`,
-`seconds=10.0`.
-
-CFG: `pred = neg + scale * (pos - neg)`, both branches in fp32. Two full DiT
-forwards per step, so 200 for the default.
-
-**Two shortcuts worth taking, both verified:**
-
-* The negative prompt is the empty string, which tokenizes to *zero* real tokens
-  and is then hard-zeroed — so the unconditional context is **exactly
-  `zeros([1, 512, 2048])`**. Skip Qwen3 entirely for that branch, and precompute
-  its cross-attention K/V once for the whole run (the text embedding does not
-  change across the 100 steps — cache the positive branch's K/V too).
-* **Duration is purely textual.** The prompt gets `f" duration: {seconds:.1f}s"`
-  appended (single ASCII space, one decimal, trailing `s`), and the DiT *always*
-  generates 1500 latents = 30 s regardless; the waveform is cropped to
-  `48000 * seconds` afterwards. Do not try to shorten the latent.
-
-Text conditioning: Qwen3-1.7B run as a causal LM, `hidden_states[-1]` (i.e. after
-the final RMSNorm), no pooling, no projection (text_dim 2048 already equals its
-hidden size — the 2048→1536 projection lives in the DiT as `txt_emb`).
-Tokenized with `padding='max_length', max_length=512, truncation=True`, **no BOS
-and no EOS**, right-padded with 151643, then rows past the real length are
-zeroed.
-
-Wiring: `Model::load` currently *requires* a libllama backbone
-(`src/model.cpp`, the `llama_model_load_from_file` throw). For SoundEffect the
-backbone genuinely is a Qwen3 GGUF, so this happens to be fine — but the
-generation entry point is completely different. Add a `generate_flow()` rather
-than trying to bend `generate()`; they share only the model loader, the aux
-backend, the tokenizer and the CLI/server shell.
-
-### SFX-5 — verify, quantize, ship
-
-Quantize the DiT to Q8 but **keep `t_emb`, `t_proj`, every `mod`
-(`scale_shift_table`), the head, and the whole VAE decoder at F16/F32** — the
-modulation path is low-rank and precision-sensitive.
-
-Ship to a new `ilintar/moss-soundeffect-gguf`. **Confirm with the user before
-uploading** — it is public and name-attributed.
+**A caveat about what `latent_final` proves.** Less than you would think. The
+guidance signal `rms(vpos - vneg) / rms(vpos)` starts at 23% and decays to under
+1% within a handful of steps, so a port with a badly wrong text encoder still
+lands close on the final latent. Diff `--dump-context` against
+`ref_pipe/context_pos.bin` to test that path directly — that is how the
+libllama f16-accumulation problem was found, well after the latent comparison
+had already "passed".
 
 ## Traps already hit (do not rediscover these)
 
-1. **Snake reciprocals must stay f32.** Three of the 15936 decoder alphas are
-   ~8e-6, giving `1/(a+1e-9)` up to 1.2e5 — past f16's 65504 ceiling. Cast to
-   f16 they become `inf` and silently poison the waveform. The sidecar writer
-   now preserves f32 when a collector chooses it; keep it that way.
-2. **Neither conv needs transposing.** `ggml_conv_1d` reads its kernel as
-   ne=(K, IC, OC) and PyTorch's `[OC, IC, K]` gives that; `ggml_conv_transpose_1d`
-   wants ne=(K, OC, IC) and PyTorch's `[IC, OC, K]` gives that. Confirmed in the
-   produced GGUF.
-3. **Weight-norm's `g` axis differs between the conv flavours** — output channels
-   for Conv1d, *input* channels for ConvTranspose1d — but both put the indexed
-   axis first, so one code path handles both.
-4. **`resolve_model_dir` / `detect_family`** must handle a diffusers layout:
-   SoundEffect has `model_index.json` and no top-level `config.json`.
-5. From the TTS-Local work, still relevant: a projection's *absence* must never be
-   inferred from matching dimensions (`src/codec.cpp` used to, and v2 would have
-   silently dropped 10 learned square matrices).
+1. **ggml's Vulkan backend accumulates matmuls in f16 by default.** Any node left
+   at `GGML_PREC_DEFAULT` picks the f16acc pipeline, costing ~5e-3 relative over
+   a 1536-long dot product — 25x the f16 weight budget. Call
+   `ggml_mul_mat_set_prec(node, GGML_PREC_F32)`. It hides well: matrix-*vector*
+   products take a different, f32-accumulating path, so `t` (computed one column
+   at a time) was exact while every wide seam was off by the same flat amount.
+   That flatness is the tell.
 
-## Verifying against the reference
+   This bit **twice** — the second time inside libllama's backbone graph, where
+   there is no node to set. `GGML_VK_DISABLE_F16=1` (i.e. `--vk-f32`) is the
+   answer there. Measure the speed cost rather than assuming one: it was zero
+   here, because the weights stay f16 in memory either way and only shader
+   compute precision moves.
 
-`flash_attn` is not installed and MOSS configs request `flash_attention_2`. The
-setting is captured **per-module at construction**, so overriding the config
-before `from_pretrained` does nothing. Patch the instances:
+2. **`ggml_set_output` on a *view* protects nothing** — the parent owns the
+   buffer. The `t_mod` tap read whatever block 29 later wrote there. Flag the
+   view's parent.
 
-```python
-for mod in m.modules():
-    if hasattr(mod, "attn_implementation"):
-        mod.attn_implementation = "sdpa"
-```
+3. **`ggml_gallocr_needs_realloc` ignores output flags.** It compares node
+   counts, shapes and sources, so a tapped graph silently reuses an untapped
+   one's allocation plan and the taps read overwritten buffers. Invisible on
+   small inputs, where there is enough slack that no reuse happens. Tapped runs
+   now get their own allocator.
 
-Compare at seams, not on generated audio — greedy output diverges from f16
-numerics alone (several codebooks sit on ties as tight as 0.009). Good seams:
-prompt ids, one block forward given a fixed input, the final latent, the decoded
-waveform.
+4. **`ggml_conv_transpose_1d` asserts `p0 == 0`, `d0 == 1`, a 2-D input, and
+   Vulkan only has an f32 x f32 pipeline for it.** So the transposed convs run
+   unpadded and crop afterwards: ggml gives `L = (T-1)s + k`, PyTorch gives
+   `L = (T-1)s - 2p + k + op`, so `p` comes off the left and `p - op` off the
+   right. With `k = 2s`, `p = ceil(s/2)`, `op = s%2` that is exactly `s*T`.
 
-`tests/moss_local_probe.cpp` is the pattern to copy: feed a fixed tensor from a
-raw f32 file into one isolated subgraph so a mismatch cannot be blamed on
-upstream drift.
+5. **`ggml_conv_1d` hardcodes an f16 im2col buffer** — a precision floor on the
+   activations, and over a gigabyte at full length. `conv1d_()` in `dac_vae.cpp`
+   does the im2col in f32 by hand, which needs f32 kernels; those are
+   materialised once at construction with a cast-and-copy graph.
+
+6. **Snake reciprocals must stay f32.** Three of the 15936 decoder alphas are
+   small enough that `1/(a + 1e-9)` exceeds f16's 65504 ceiling, and **one of
+   them is negative** (so a clamp-to-positive guard would be wrong). The f16
+   failure is not merely inaccurate: the reciprocal goes to inf while
+   `sin(a*x)^2` underflows to exactly 0 on those same channels, and `inf * 0` is
+   NaN.
+
+7. **A projection's absence must never be inferred from matching dimensions**
+   (from the TTS-Local work; `src/codec.cpp` used to, and v2 would have silently
+   dropped 10 learned square matrices).
+
+## Things the reference does that look like bugs but are not
+
+* **The unconditional context is exactly zeros.** The negative prompt is the
+  empty string, which tokenizes to zero real tokens, and the encoder then zeroes
+  every row past the real length. Qwen3 is skipped entirely for that branch.
+* **Duration is textual.** The prompt gets `f" duration: {seconds:.1f}s"` and the
+  DiT always denoises the full `max_seconds`; only the waveform is cropped.
+* **Padding never needs to reach the backbone.** Upstream right-pads to 512 with
+  an attention mask, but the encoder is causal, so a real token at position i
+  attends only to 0..i — all real. Running just the real tokens is exact and
+  skips up to 511 forwards. libllama's `t_embd` is set right after
+  `result_norm`, the same tensor HF exposes as `hidden_states[-1]`.
+* **The `chunk(3)` on the RoPE table is a no-op.** `precompute_freqs_cis_1d`
+  splits 64 into 22/22/20 and `forward` concatenates them straight back. Do not
+  mimic the uneven split; it is a plain 1-D RoPE, theta 10000, head_dim 128.
+* **`norm_q`/`norm_k` are RMSNorm over the full 1536 axis, not per-head.** Apply
+  before reshaping into heads.
+* **Only `norm3` is affine** inside a block, and the diffusers export stores it
+  under the name `norm2`. The converter already renames it.
+* **The head takes the plain time embedding `t`, not `t_mod`**, with its own
+  `[1, 2, dim]` modulation: index 0 = shift, 1 = scale.
+* **FFN GELU is `approximate='tanh'`** — `ggml_gelu`, not `ggml_gelu_erf`.
+
+## What is left
+
+### Ship it
+
+The Q8_0 sidecar is verified and ready. Publishing would go to a new
+`ilintar/moss-soundeffect-gguf`. **Confirm with the user before uploading** — it
+is public and name-attributed, and that authorisation has not been given.
+
+Note the backbone is a plain Qwen3-1.7B GGUF and could also be quantised with
+`llama-quantize` (untested for this family; the text encoder's hidden state is
+the conditioning, so it is worth diffing `context_pos` before trusting it).
+
+### Phase 6 — the server option surface
+
+Deliberately deferred to last at the user's direction, and still untouched. The
+CLI half is done. Per the sglang-omni cookbooks it needs: `references[]` with
+`ref_audio`/`ref_text` (the transcript path needs *continuation mode* —
+reference audio in the assistant channel, slot 151656, no `audio_end`),
+flattened per-channel sampling on `/v1/audio/speech`, `token_count` plus the
+inline `${token:N}` prefix, `response_format: pcm`, `GET /v1/models`, and a
+voices registry at `/v1/audio/voices` (no upstream standard exists — `voice` is
+always `"default"` in every cookbook; the vLLM-Omni convention is the closest).
+
+SoundEffect needs its own endpoint shape too: prompt, seconds, steps, cfg_scale.
+
+Streaming needs its own design pass: the TTS codec's summed receptive field is
+35 s, so block decode with warm-up is not viable and it wants per-stage KV
+caching. SoundEffect cannot stream at all in the usual sense — the solver only
+produces a usable latent after the last step.
+
+### Smaller things
+
+* `generate_sound_effect()` constructs `DiTGraph` and `DacDecoder` per call, and
+  the latter materialises ~300 MB of f32 kernels each time. Fine for a one-shot
+  CLI, wasteful for a server — cache them on `Model` the way `Model::codec()`
+  does.
+* `docs/STATUS.md` still describes only the delay family; it predates both
+  MOSS-TTS-Local and this work.
 
 ## Listening to output
 
-A Lemonade server runs on `:8000` with `gemma-4-E4B-it-GGUF-Q6_K`, which accepts
-audio and transcribes accurately. Load it with
-`POST /api/v1/load {"model_name": "gemma-4-E4B-it-GGUF-Q6_K"}` and send
-`{"type": "input_audio", "input_audio": {"data": <b64 wav>, "format": "wav"}}`
-to `/api/v1/chat/completions`. Convert to **16 kHz mono** first (`audioop` is
-gone in Python 3.13+; there is a hand-rolled converter in the scratchpad's
-`ask_audio.py`).
+A Lemonade server on `:8000` with `gemma-4-E4B-it-GGUF-Q6_K` accepts audio.
+Load with `POST /api/v1/load {"model_name": "gemma-4-E4B-it-GGUF-Q6_K"}` and
+send `{"type": "input_audio", "input_audio": {"data": <b64 wav>, "format":
+"wav"}}` to `/api/v1/chat/completions`. Convert to **16 kHz mono** first; there
+is a hand-rolled converter in the scratchpad's `ask_audio.py` (`audioop` is gone
+in Python 3.13+).
 
-Caveats: it intermittently claims "no audio was provided" for clips it just
-transcribed — **always run a known-good control clip first** so a refusal is not
-mistaken for a bad sample. It is also unreliable at describing *voice
-characteristics* (it tends to transcribe instead), so it could not settle
-whether voice cloning transfers speaker identity. Multiple `input_audio` parts
-in one request do work, and an A/B "SAME or DIFFERENT" prompt passes its own
-sanity check, but the judge is too noisy to rely on.
+Two caveats, both hit again this session. It is a *reasoning* model, so a small
+`max_tokens` is consumed entirely by `reasoning_content` and `content` comes back
+empty — budget 1200+, and read `reasoning_content` when `content` is empty. And
+it is genuinely unreliable: it intermittently claims "no audio was provided" for
+clips it just processed, and misidentified a glass smash as a chainsaw. **Always
+run a known-good control clip first.**
 
-## Also still open
-
-**Phase 6, the server option surface** — deliberately deferred to last at the
-user's direction. The CLI half is done (per-channel sampling flags, `--seed`,
-`--dump-codes`); the HTTP half is untouched. It needs, per the sglang-omni
-cookbooks: `references[]` with `ref_audio`/`ref_text` (the transcript path needs
-*continuation mode* — reference audio in the assistant channel, slot 151656, no
-`audio_end`), flattened per-channel sampling on `/v1/audio/speech`,
-`token_count` plus the inline `${token:N}` prefix, `response_format: pcm`,
-`GET /v1/models`, and a voices registry at `/v1/audio/voices` (no upstream
-standard exists — `voice` is always `"default"` in every cookbook; the vLLM-Omni
-convention is the closest thing).
-
-Streaming needs its own design pass: the codec's summed receptive field is 35 s,
-so block decode with warm-up is not viable and it wants per-stage KV caching.
+For sound effects the **envelope is a better judge than the model**. Bin the RMS
+into 0.5 s slices and look at the shape: "a dog barking twice" gives two discrete
+bursts separated by silence, "heavy rain on a tin roof" is flat and sustained,
+"a single glass shattering on stone" is one sharp transient with a decay tail.
+That matched the prompt in all three cases and needs no external model.
