@@ -23,6 +23,12 @@
 // usage: moss-sfx-probe <model.gguf> <ref_dir> [suffix]
 //   Reads raw little-endian float32 dumps named <ref_dir>/<seam><suffix>.bin.
 //   `suffix` selects an alternate case (e.g. "_t16" for the 16-frame one).
+//
+//   MOSS_AUX_CPU=1   rerun on the CPU backend, isolating a graph error from a
+//                    backend numerics difference.
+//   MOSS_SEAM_TOL=F  raise the per-seam budget, which is calibrated for an f16
+//                    sidecar. A Q8_0 one sits around 5e-3 at every seam while
+//                    leaving dit_out-dc unchanged.
 
 #include <cmath>
 #include <cstdio>
@@ -188,11 +194,18 @@ int main(int argc, char ** argv) {
     // rerunning the fp32 reference with its weights round-tripped through f16.
     // The error does not accumulate over the 30 blocks, so one budget covers all
     // of them; 1e-3 leaves room for the backends' own f16 intermediates.
-    constexpr double SEAM_TOL = 1e-3;
+    // A quantised sidecar legitimately exceeds this — Q8_0 lands around 5e-3 at
+    // every seam — so raise it with MOSS_SEAM_TOL rather than reading a failure
+    // as a porting bug. Note that the seams are where quantisation shows up and
+    // `dit_out-dc` is where it does not: weight-rounding error is almost
+    // entirely frame-constant, and the head passes that at ~0.8x while
+    // amplifying frame-varying error ~50x.
+    double SEAM_TOL = 1e-3;
+    if (const char * env = std::getenv("MOSS_SEAM_TOL")) SEAM_TOL = std::atof(env);
     // The head is a different story. Its LayerNorm collapses every frame onto
     // nearly one direction, so whatever error arrives is amplified ~50x in the
     // demeaned output. 5e-2 is what the f16 budget turns into after that gain.
-    constexpr double HEAD_TOL = 5e-2;
+    const double HEAD_TOL = 5e-2;
 
     int failures = 0;
     auto check = [&](const char * what, double tol, const std::vector<float> & got,

@@ -102,6 +102,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -780,6 +781,52 @@ def write_soundeffect_kv(writer, moss_config: dict, moss_dir: Path):
                       int(moss_config.get("max_inference_seconds", 30)))
 
 
+# Sidecar tensors that may be quantised, and why the rest may not be.
+#
+# Only the DiT's projection matrices are eligible — everything ggml_mul_mat
+# consumes as a weight. That is 1.39 B of the sidecar's 1.49 B parameters, so
+# the exclusions cost almost nothing in size while removing all of the risk:
+#
+#   t_emb, t_proj, blk.N.mod, mod, head
+#       The modulation path. It is low-rank, and the head's non-affine
+#       LayerNorm amplifies any error reaching it by ~50x: residual channel 421
+#       grows to ~50x its neighbours by the last block, so every frame collapses
+#       onto nearly one direction and only the small demeaned remainder carries
+#       the per-frame signal.
+#   patch.weight
+#       Stored as a kernel-1 Conv1d, so its first ggml axis is 1 — no block
+#       quantisation can represent that.
+#   moss.vae.*
+#       The decoder is only 151 MB, and its Snake reciprocals must stay f32 or
+#       they overflow to inf (and then to NaN, since sin(alpha*x)^2 underflows
+#       to zero on exactly those channels).
+_QUANTISABLE_SIDECAR = re.compile(
+    r"^moss\.dit\.(blk\.\d+\.(sa|ca)\.[qkvo]|blk\.\d+\.ffn\.[12]|txt_emb\.[12])"
+    r"\.weight$")
+
+
+def resolve_sidecar_quant(spec: str | None):
+    """Map a --sidecar-dtype string to a GGMLQuantizationType, or None for f16."""
+    if not spec or spec == "f16":
+        return None
+    from gguf import GGMLQuantizationType
+    try:
+        return getattr(GGMLQuantizationType, spec.upper())
+    except AttributeError:
+        raise SystemExit(f"--sidecar-dtype {spec!r} is not a known GGML type")
+
+
+def _sidecar_quant_type(name: str, arr: "np.ndarray", quant):
+    """The GGML type to store `name` as, or None to keep it f16/f32."""
+    if quant is None or not _QUANTISABLE_SIDECAR.match(name):
+        return None
+    # Block quantisation runs along the first ggml axis, which is the *last*
+    # numpy axis (gguf reverses the shape on write).
+    if arr.ndim != 2 or arr.shape[-1] % 32 != 0:
+        return None
+    return quant
+
+
 class Family:
     """Everything that differs between MOSS model families."""
 
@@ -864,7 +911,8 @@ def write_moss_sidecar(out_gguf: Path,
                        moss_config: dict, moss_dir: Path,
                        codec_dir: Path | None,
                        fam: Family,
-                       llama_cpp_dir: Path | None = None) -> None:
+                       llama_cpp_dir: Path | None = None,
+                       sidecar_quant=None) -> None:
     """Write the MOSS extras (audio embeddings, family-specific heads, optional
     codec, plus the moss.* KV namespace) into a sidecar GGUF.
 
@@ -956,11 +1004,23 @@ def write_moss_sidecar(out_gguf: Path,
     # (alpha gets as small as 8.3e-6, giving 1.2e5). Rounding them to inf would
     # feed inf into the decoder and corrupt the waveform silently.
     audio_count = 0
+    quant_count = 0
     for name, arr in fam.collect_extras(moss_dir, moss_config):
-        writer.add_tensor(name, arr if arr.dtype == np.float32
-                                else arr.astype(np.float16))
+        qtype = _sidecar_quant_type(name, arr, sidecar_quant)
+        if qtype is not None:
+            from gguf import quants
+            # No raw_shape: gguf treats that argument as a *byte* shape and
+            # derives the logical one from it, which is exactly what the
+            # quantized array's own shape already is.
+            writer.add_tensor(name, quants.quantize(arr.astype(np.float32), qtype),
+                              raw_dtype=qtype)
+            quant_count += 1
+        else:
+            writer.add_tensor(name, arr if arr.dtype == np.float32
+                                    else arr.astype(np.float16))
         audio_count += 1
-    log.info("added %d MOSS audio/head tensors", audio_count)
+    log.info("added %d MOSS audio/head tensors (%d quantised to %s)",
+             audio_count, quant_count, sidecar_quant.name if sidecar_quant else "none")
 
     # ── 3. add codec tensors (optional) ────────────────────────────────────
     if codec_dir is not None:
@@ -1019,6 +1079,11 @@ def main():
                     help="Temp dir for the extracted Qwen3 backbone (default: a tempdir)")
     ap.add_argument("--backbone-dtype", default="f16", choices=["f16", "f32", "bf16"],
                     help="Output dtype for the backbone (default: f16)")
+    ap.add_argument("--sidecar-dtype", default="f16", choices=["f16", "q8_0"],
+                    help="Storage for the sidecar's large projection matrices "
+                         "(default: f16). q8_0 halves the MOSS-SoundEffect DiT; "
+                         "the modulation path, the head and the VAE always stay "
+                         "f16/f32 regardless")
     ap.add_argument("--keep-scratch", action="store_true",
                     help="Don't delete the scratch dir after conversion")
     ap.add_argument("--skip-extract", action="store_true",
@@ -1098,7 +1163,8 @@ def main():
         sidecar_path = out_path.with_suffix(".extras.gguf")
         log.info("=== stage 3b: write MOSS sidecar → %s ===", sidecar_path)
         write_moss_sidecar(sidecar_path, moss_config, moss_dir, codec_dir,
-                           fam, Path(args.llama_cpp_dir))
+                           fam, Path(args.llama_cpp_dir),
+                           sidecar_quant=resolve_sidecar_quant(args.sidecar_dtype))
     finally:
         if cleanup_scratch:
             shutil.rmtree(scratch, ignore_errors=True)
