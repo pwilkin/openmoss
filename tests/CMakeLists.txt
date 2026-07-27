@@ -9,3 +9,6 @@ target_link_libraries(moss-tts-compute-test PRIVATE openmoss_core)
 
 add_executable(moss-codec-roundtrip ${CMAKE_CURRENT_SOURCE_DIR}/moss_codec_roundtrip.cpp)
 target_link_libraries(moss-codec-roundtrip PRIVATE openmoss_core)
+
+add_executable(moss-local-probe ${CMAKE_CURRENT_SOURCE_DIR}/moss_local_probe.cpp)
+target_link_libraries(moss-local-probe PRIVATE openmoss_core)
