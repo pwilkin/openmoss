@@ -2,9 +2,10 @@
 
 Branch: `feat/moss-tts-local` (off `main`). Everything below is committed.
 
-> **The branch has never been pushed.** All 25 commits exist only on this disk,
-> and `origin` still has just `main` at 64eabe0 (July 11). That is the single
-> most important operational fact here.
+> **This work is published.** `origin/main` was fast-forwarded from 64eabe0
+> (July 11) to 0cea224 on 2026-07-28 — 28 commits, everything below. The long
+> unpushed period is over; `main` and `feat/moss-tts-local` now point at the
+> same commit.
 
 ## TL;DR
 
@@ -257,7 +258,8 @@ the flag. Progress over SSE remains the only thing worth exposing there;
 * The WebUI does not use streaming; it still posts and waits.
 * README drift predating this work — the endpoint list omits `/sfx`, and several
   option descriptions still assume 24 kHz mono.
-* The `main` branch is 14 commits behind this one and this branch is unpushed.
+* Nothing is unpushed. `main` == `feat/moss-tts-local` == `origin/main`, so new
+  work should start from a fresh branch rather than continuing on this one.
 
 ## Listening to output
 
