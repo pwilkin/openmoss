@@ -33,6 +33,8 @@
 //     "tokens":            int,       // legacy alias for token_count
 //     "max_new_tokens":    int,       // default 4096
 //     "response_format":   str,       // "wav" (default) | "pcm"
+//     "stream":            bool,      // default false. See "Streaming" below.
+//     "stream_chunk_frames": int,     // default 8; a frame is 80 ms
 //     "reference_wav_b64": str,       // base64 of a WAV file for voice cloning
 //     "ref_text":          str,       // transcript of the reference. Selects
 //                                     //   continuation mode (moss_tts_local
@@ -65,12 +67,36 @@
 //     "input":             str,       // required — text, or the sound description
 //     "voice":             str,       // TTS only — mapped to instruction
 //     "response_format":   str,       // "wav" (default) | "pcm"
+//     "stream":            bool,      // TTS only. See "Streaming" below.
+//     "stream_chunk_frames": int,     // default 8; a frame is 80 ms
 //     "speed":             float,     // TTS only — 0.25..4.0, scales token budget
 //     …                               // sampling keys may also be passed flat
 //                                     //   here, as the cookbooks send them; for
 //                                     //   MOSS-SoundEffect the /sfx solver
 //                                     //   fields are accepted instead
 //   }
+//
+// Streaming
+// ---------
+// `"stream": true` on /tts or /v1/audio/speech answers with chunked transfer,
+// writing each codec chunk as it is decoded rather than buffering the whole
+// utterance. It cuts time-to-first-audio from the full generation time to
+// roughly one chunk (~0.7 s for the default 8 frames on MOSS-TTS-Local),
+// at the cost of about 8% total throughput, since the codec now runs inline
+// with generation.
+//
+// It requires `response_format: "pcm"`. A RIFF header states its own data
+// length in its first 44 bytes and that is unknown until generation stops, so
+// rather than emit a header that lies the endpoint rejects the combination.
+// X-MOSS-Sample-Rate and X-MOSS-Channels carry what a player needs.
+//
+// The status line is sent before generation starts, so a mid-stream failure
+// truncates the response instead of becoming a 500 — the request is fully
+// validated first, and failures are logged server-side.
+//
+// MOSS-SoundEffect cannot stream at all: flow matching refines every latent
+// frame simultaneously, so no prefix of the audio exists until the last solver
+// step finishes. /sfx rejects the flag.
 //
 // A note on voices: there is no upstream standard. Every MOSS cookbook passes
 // voice="default", and cloning is driven by reference audio rather than a named
@@ -253,6 +279,10 @@ void send_text_error(httplib::Response & rs, int status, const std::string & msg
     rs.set_content(msg + "\n", "text/plain");
 }
 
+// Thrown out of a stream callback when the socket is gone. generate() has no
+// cancellation channel, so unwinding is the only way to stop it early.
+struct StreamAborted {};
+
 // ── response encoding ─────────────────────────────────────────────────────
 //
 // `wav` is a RIFF file; `pcm` is the same samples with no container, which is
@@ -269,15 +299,7 @@ struct Encoded {
 Encoded encode_audio(const std::string & fmt, const float * pcm, int64_t n_samples,
                      int32_t sample_rate, int32_t channels) {
     if (fmt == "pcm") {
-        std::vector<uint8_t> raw(size_t(n_samples) * 2);
-        for (int64_t i = 0; i < n_samples; ++i) {
-            float v = pcm[i];
-            v = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
-            const uint16_t u = uint16_t(int16_t(std::lround(v * 32767.0f)));
-            raw[size_t(i) * 2 + 0] = uint8_t(u & 0xff);
-            raw[size_t(i) * 2 + 1] = uint8_t((u >> 8) & 0xff);
-        }
-        return { std::move(raw), "audio/pcm" };
+        return { openmoss::encode_pcm_s16le(pcm, n_samples), "audio/pcm" };
     }
     return { openmoss::encode_wav(pcm, n_samples, sample_rate, channels), "audio/wav" };
 }
@@ -504,6 +526,89 @@ int main(int argc, char ** argv) {
         return req;
     };
 
+    // Chunked-transfer TTS: hand each codec chunk to the socket as it is
+    // decoded, instead of buffering the whole utterance.
+    //
+    // Two consequences the caller has to live with, both inherent to answering
+    // before the audio exists:
+    //
+    //   * The format is raw PCM, not WAV. A RIFF header states its own data
+    //     length in its first 44 bytes, and that is not known until generation
+    //     stops. Rather than emit a header that lies, the endpoint rejects
+    //     response_format=wav for a streamed request and reports the rate and
+    //     channel count in headers instead.
+    //
+    //   * The status line goes out before generation starts, so a failure
+    //     partway through truncates the stream — it cannot become a 500. The
+    //     request is validated fully before we commit to streaming, which
+    //     leaves model-level failures as the only case, and those already show
+    //     up in the server log.
+    //
+    // The provider runs on the connection's own thread after the handler
+    // returns, so `req` is captured by value and the generation mutex is taken
+    // inside it — requests still serialise exactly as they did before.
+    auto stream_tts = [&](openmoss::GenerateRequest req, uint64_t req_id,
+                          httplib::Response & rs) {
+        const auto  t0       = std::chrono::steady_clock::now();
+        const int32_t rate   = model->dims().sampling_rate;
+        const int32_t chans  = model->dims().n_channels;
+
+        rs.set_header("X-MOSS-Sample-Rate", std::to_string(rate));
+        rs.set_header("X-MOSS-Channels",    std::to_string(chans));
+        rs.set_header("X-MOSS-Stream-Chunk-Frames",
+                      std::to_string(req.stream_chunk_frames));
+
+        rs.set_chunked_content_provider("audio/pcm",
+            [this_model = model.get(), &gen_mu, req, req_id, t0, rate, chans]
+            (size_t /*offset*/, httplib::DataSink & sink) -> bool {
+                // Everything happens in the first invocation; sink.done() ends it.
+                int64_t total = 0;
+                bool    first = true;
+                double  ttfa  = 0.0;
+                try {
+                    std::lock_guard<std::mutex> g(gen_mu);
+                    std::fprintf(stderr,
+                        "[server] req#%llu stream text=%zu chars ref=%s chunk=%d frames\n",
+                        (unsigned long long)req_id, req.text.size(),
+                        req.reference_wav ? "yes" : "no", req.stream_chunk_frames);
+                    openmoss::generate(*this_model, req,
+                        [&](const float * pcm, int64_t n_samples) {
+                            const auto bytes = openmoss::encode_pcm_s16le(pcm, n_samples);
+                            if (!sink.write(reinterpret_cast<const char *>(bytes.data()),
+                                            bytes.size())) {
+                                // The client hung up. There is no way to ask
+                                // generate() to stop politely, so unwind — the
+                                // catch below treats it as a normal end.
+                                throw StreamAborted{};
+                            }
+                            total += n_samples;
+                            if (first) {
+                                ttfa = std::chrono::duration<double>(
+                                           std::chrono::steady_clock::now() - t0).count();
+                                first = false;
+                            }
+                        });
+                } catch (const StreamAborted &) {
+                    std::fprintf(stderr, "[server] req#%llu stream: client disconnected "
+                                 "after %lld samples\n",
+                                 (unsigned long long)req_id, (long long)total);
+                } catch (const std::exception & e) {
+                    std::fprintf(stderr, "[server] req#%llu stream FAILED after %lld "
+                                 "samples: %s\n",
+                                 (unsigned long long)req_id, (long long)total, e.what());
+                }
+                const double total_s = std::chrono::duration<double>(
+                                           std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(stderr,
+                    "[server] req#%llu stream done: %lld samples (%.2fs audio) — "
+                    "first audio %.2fs, total %.2fs\n",
+                    (unsigned long long)req_id, (long long)total,
+                    double(total) / double(rate) / double(chans), ttfa, total_s);
+                sink.done();
+                return true;
+            });
+    };
+
     auto handle_sfx = [&](const json & body, const std::string & fmt,
                           uint64_t req_id, httplib::Response & rs) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -563,6 +668,14 @@ int main(int argc, char ** argv) {
             return send_text_error(rs, 400,
                 "unsupported response_format '" + fmt + "'; use 'wav' or 'pcm'");
         }
+        // Refuse rather than quietly ignore: a caller asking for a stream and
+        // getting one 90-second response instead would look like a hang.
+        if (jget(body, "stream", false)) {
+            return send_text_error(rs, 400,
+                "moss_soundeffect cannot stream: flow matching refines every latent "
+                "frame simultaneously, so no prefix of the audio exists until the last "
+                "solver step finishes");
+        }
         handle_sfx(body, fmt, req_id, rs);
     });
 
@@ -592,6 +705,14 @@ int main(int argc, char ** argv) {
             return send_text_error(rs, 400,
                 "unsupported response_format '" + fmt + "'; use 'wav' or 'pcm'");
         }
+        const bool want_stream = jget(body, "stream", false);
+        if (want_stream && fmt != "pcm") {
+            return send_text_error(rs, 400,
+                "stream=true requires response_format 'pcm': a WAV header declares its "
+                "own data length, which is not known until generation ends. The "
+                "X-MOSS-Sample-Rate and X-MOSS-Channels response headers carry what a "
+                "player needs.");
+        }
 
         openmoss::GenerateRequest req;
         req.text          = body["text"].get<std::string>();
@@ -611,6 +732,8 @@ int main(int argc, char ** argv) {
         if (body.contains("tokens") && body["tokens"].is_number_integer())
             req.tokens      = body["tokens"].get<int>();
         req.max_new_tokens  = jget(body, "max_new_tokens", req.max_new_tokens);
+        req.stream_chunk_frames =
+            std::max(1, jget(body, "stream_chunk_frames", req.stream_chunk_frames));
         req.sampling        = parse_sampling(body.value("sampling", json::object()),
                                              default_sampling(model->dims().n_vq));
         finalize_voicegen_request(req, model->dims());
@@ -644,6 +767,8 @@ int main(int argc, char ** argv) {
                 }
             }
         }
+
+        if (want_stream) return stream_tts(std::move(req), req_id, rs);
 
         openmoss::GenerateResult result;
         try {
@@ -715,11 +840,25 @@ int main(int argc, char ** argv) {
             return send_text_error(rs, 400,
                 "unsupported response_format '" + fmt + "'; use 'wav' or 'pcm'");
         }
+        const bool want_stream = jget(body, "stream", false);
+        if (want_stream && fmt != "pcm") {
+            return send_text_error(rs, 400,
+                "stream=true requires response_format 'pcm': a WAV header declares its "
+                "own data length, which is not known until generation ends. The "
+                "X-MOSS-Sample-Rate and X-MOSS-Channels response headers carry what a "
+                "player needs.");
+        }
 
         // MOSS-SoundEffect answers this route too, treating `input` as the sound
         // description. Its solver options are accepted as extensions; `voice` and
         // `speed` have no meaning for it and are ignored.
         if (model->dims().arch == openmoss::Arch::SoundEffect) {
+            if (want_stream) {
+                return send_text_error(rs, 400,
+                    "this server loaded moss_soundeffect, which cannot stream: flow "
+                    "matching refines every latent frame simultaneously, so no prefix "
+                    "of the audio exists until the last solver step finishes");
+            }
             return handle_sfx(body, fmt, req_id, rs);
         }
 
@@ -784,7 +923,11 @@ int main(int argc, char ** argv) {
         req.sampling       = parse_sampling(body.value("sampling", json::object()),
                                             default_sampling(model->dims().n_vq));
         req.sampling       = parse_sampling(body, req.sampling);
+        req.stream_chunk_frames =
+            std::max(1, jget(body, "stream_chunk_frames", req.stream_chunk_frames));
         finalize_voicegen_request(req, model->dims());
+
+        if (want_stream) return stream_tts(std::move(req), req_id, rs);
 
         openmoss::GenerateResult result;
         try {

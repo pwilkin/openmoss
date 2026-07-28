@@ -172,6 +172,8 @@ Common options:
 | `--no-flash-attn`     | disable flash attention                                            |
 | `--skip-codec`        | don't load codec tensors; emits codes only (debug, saves ~3.4 GB)  |
 | `--aux-cpu`           | run audio embeds + codec on CPU (workaround for backends missing ops); backbone stays on GPU |
+| `--stream [N]`        | decode incrementally, N frames per chunk (default 8; a frame is 80 ms) |
+| `--stream-out PATH`   | also write each chunk as raw s16le as it arrives; `-` is stdout    |
 
 ### Plain TTS
 
@@ -200,6 +202,26 @@ voice.
 
 Any sample rate works — the WAV is linearly resampled to 24 kHz internally. A few seconds of
 clean speech is usually enough.
+
+### Streaming
+
+`--stream` decodes the codec alongside generation instead of once at the end, so audio
+exists long before the utterance is finished. The WAV written at exit is the same either
+way; what changes is when you can hear it.
+
+```bash
+# play it as it is generated (48 kHz stereo — use -r 24000 -c 1 for the delay family)
+./build/moss-tts-cli \
+    --model weights/moss-tts-local-1.5-q8_0.gguf \
+    --text  "Streaming means the first words arrive long before the last ones do." \
+    --stream 8 --stream-out - --output out.wav \
+  | aplay -f S16_LE -r 48000 -c 2
+```
+
+Smaller chunks mean lower latency and more overhead — the decode runs inline with
+generation, so it stalls the LM. See [docs/STREAMING.md](docs/STREAMING.md) for the
+measured curve and for why the codec needs a per-stage KV cache rather than simple
+chunking.
 
 ## Server usage
 
@@ -239,10 +261,30 @@ The CMake build stages the source tree's `webui/` next to the server binary, so 
 | `tokens`              | int      | no       | approximate length (1 s ≈ 12.5 tokens)                   |
 | `max_new_tokens`      | int      | no       | default 4096                                             |
 | `reference_wav_b64`   | string   | no       | base64-encoded WAV bytes for voice cloning               |
+| `response_format`     | string   | no       | `"wav"` (default) or `"pcm"` — raw 16-bit little-endian, no container |
+| `stream`              | bool     | no       | default false; chunked transfer, requires `"pcm"` (see below) |
+| `stream_chunk_frames` | int      | no       | default 8; one frame is 80 ms of audio                   |
 | `sampling`            | object   | no       | `text_temperature`, `text_top_p`, `text_top_k`, `audio_temperature`, `audio_top_p`, `audio_top_k`, `audio_repetition_penalty`, `seed` |
 
 Response headers carry timing info: `X-MOSS-Audio-Frames`, `X-MOSS-Generate-Seconds`,
 `X-MOSS-Decode-Seconds`.
+
+#### Streaming
+
+`"stream": true` answers with chunked transfer, writing each codec chunk as it is
+decoded instead of buffering the whole utterance. On MOSS-TTS-Local this cuts time to
+first audio from 2.54 s to 0.57 s for a 4.8 s utterance, at +31% total time — the codec
+now runs inline with generation. Larger `stream_chunk_frames` recovers the throughput:
+16 frames costs +7% and still answers in 0.83 s. Audio arrives faster than real time at
+every setting, so playback never starves. Full measurements in
+[docs/STREAMING.md](docs/STREAMING.md).
+
+It requires `response_format: "pcm"`. A RIFF header states its own data length in its
+first 44 bytes and that is unknown until generation ends, so the endpoint rejects the
+`wav` combination rather than emit a header that lies; `X-MOSS-Sample-Rate` and
+`X-MOSS-Channels` carry what a player needs. MOSS-SoundEffect rejects the flag outright —
+flow matching refines every latent frame at once, so no prefix of the audio exists until
+the last solver step.
 
 The payload limit is 64 MB, which fits a ~60 s reference WAV after base64 encoding.
 
@@ -256,13 +298,17 @@ This allows drop-in compatibility with any client or SDK that targets the OpenAI
 | `input`            | string | yes      | text to synthesize (maps to native `text`)                  |
 | `model`            | string | no       | ignored (the model is already loaded at server startup)     |
 | `voice`            | string | no       | passed as an instruction hint to the model                  |
-| `response_format`  | string | no       | `"wav"` (default and only supported format; anything else is a 400) |
+| `response_format`  | string | no       | `"wav"` (default) or `"pcm"`; anything else is a 400        |
+| `stream`           | bool   | no       | default false; same semantics as `/tts`                     |
 | `speed`            | float  | no       | 0.25–4.0, scales the token budget (default 1.0)             |
 
 Validation errors (missing/non-string `input`, undecodable or non-WAV `reference_wav_b64`,
-out-of-range `speed`, unsupported `response_format`) return `400` with a `text/plain` message.
+out-of-range `speed`, unsupported `response_format`, `stream` with `wav`) return `400`
+with a `text/plain` message.
 
-Response: `audio/wav` (16-bit PCM @ 24 kHz mono), same as the native endpoint.
+Response: `audio/wav` (16-bit PCM), same as the native endpoint. Rate and channel count
+come from the loaded model — 24 kHz mono for the delay family, 48 kHz stereo for
+MOSS-TTS-Local, 48 kHz mono for MOSS-SoundEffect — never hardcoded.
 
 ### Examples
 

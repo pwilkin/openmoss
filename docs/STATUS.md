@@ -32,12 +32,10 @@ Published weights: [ilintar/moss-tts-gguf](https://huggingface.co/ilintar/moss-t
 | HTTP server | `/tts`, `/sfx`, `/v1/audio/speech`, `/v1/models`, `/v1/audio/voices`, wav + pcm |
 | WebUI | served at `/` by the server |
 | Quantization | backbone via `llama-quantize`; sidecar via the converter |
+| Streaming | done for both autoregressive families — per-stage KV cache in the codec, `--stream` in the CLI, chunked transfer in the server |
 
 ## Not done
 
-- **Streaming.** The LM half is already incremental; the codec is not. See
-  [STREAMING.md](STREAMING.md) — it needs a per-stage KV cache, and the
-  measured reason why chunking cannot substitute is documented there.
 - **Continuation mode for `moss_tts_delay`.** Different slot layout, no verified
   reference locally; `ref_text` is rejected for that family rather than silently
   ignored.
@@ -57,6 +55,7 @@ port and the PyTorch reference identical input bytes.
 | `moss-sfx-probe` | the DiT at 8 seams, at 16 and 1500 frames |
 | `moss-sfx-vae-probe` | the DAC decoder at 10 seams, plus a chunking check that must be bit-identical |
 | `moss-codec-causality` | whether the codec decoder is causal, and how much history a chunk needs |
+| `moss-codec-stream` | incremental vs batch decode. One single push must be **bit-identical**, which pins the streaming graph to the batch graph; chunked, the error must stay flat rather than grow with position |
 | `moss-codec-roundtrip` | encode→decode envelope correlation, compared first half vs second half |
 
 Two lessons worth carrying to any similar port:
@@ -88,3 +87,8 @@ Radeon 8060S (Strix Halo, Vulkan), 123 GB unified memory.
 
 `--cfg-scale 1` halves SoundEffect's solve by skipping the unconditional branch.
 `--vk-f32` is recommended on Vulkan and costs nothing measurable.
+
+Streaming trades throughput for latency, since the codec then runs inline with
+generation. At the default 8-frame chunk, time to first audio drops from 2.54 s
+to 0.57 s for a 4.8 s utterance, at +31% total time; 16-frame chunks cost only
++7% for 0.83 s. Full curve in [STREAMING.md](STREAMING.md).
