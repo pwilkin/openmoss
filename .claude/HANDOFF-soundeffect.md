@@ -9,12 +9,13 @@ PyTorch reference, MOSS-SoundEffect generates end to end from both the CLI and t
 server, and the weights are published at
 <https://huggingface.co/ilintar/moss-soundeffect-gguf>.
 
-Phase 6 (the server option surface) is also done. The one item deliberately left
-out is `ref_text` / continuation mode — see "What is left".
+Phase 6 (the server option surface) is done, including `ref_text` /
+continuation mode.
 
 ## Commits on this branch
 
 ```
+7810fce  feat(tts): continuation mode (ref_text) for MOSS-TTS-Local
 c68148b  feat(server): Phase 6 — SoundEffect endpoint and option-surface parity
 a1fae1c  docs: refresh the MOSS-SoundEffect handoff
 ce1fdcb  feat(sfx): dump the text conditioning, and --vk-f32
@@ -80,8 +81,9 @@ the other answers 400 pointing at the right one. `/v1/audio/speech` dispatches o
 the loaded architecture and answers for either. Also: `GET /v1/models`,
 `GET /v1/audio/voices`, `response_format` of `"wav"` or `"pcm"`, `token_count` or
 an inline `${token:N}` prefix, flattened sampling keys, and `references[]` with
-`ref_audio`. Set `GGML_VK_DISABLE_F16=1` in the environment — the server has no
-`--vk-f32` flag of its own.
+`ref_audio` plus optional `ref_text` (which selects continuation mode). Set
+`GGML_VK_DISABLE_F16=1` in the environment — the server has no `--vk-f32` flag
+of its own.
 
 ## Files on disk
 
@@ -170,6 +172,29 @@ lands close on the final latent. Diff `--dump-context` against
 libllama f16-accumulation problem was found, well after the latent comparison
 had already "passed".
 
+## Prompt construction is verified exactly, not approximately
+
+`tests/moss_prompt_probe.cpp` dumps the grid and diffs it against the reference
+processor. There is no numerical tolerance here — an id is right or it is not —
+and the check needs neither the codec nor the backbone, which makes it the
+cheapest thing in the repo. All three MOSS-TTS-Local layouts match every
+integer: plain 69x13, voice clone 77x13, continuation 82x13.
+
+```bash
+./build/moss-prompt-probe <model.gguf> "<text>" [ref_codes.txt] [ref_text]
+```
+
+`ref_codes.txt` is the `(n_vq, T)` matrix `--dump-codes` writes. Note the
+reference processor wants its codes the other way round, `[T, n_vq]` — transpose
+before feeding it. The generator for the reference side is the scratchpad's
+`ref_prompt.py`.
+
+Continuation mode is what `ref_text` selects: the reference goes in the
+*assistant* channel behind the trailing audio_start with no closing audio_end,
+the reference-audio block is replaced by the literal text "None", and the
+synthesis text becomes transcript + new material. Only moss_tts_local; the delay
+family's layout differs and generate() rejects `ref_text` for it.
+
 ## Traps already hit (do not rediscover these)
 
 1. **ggml's Vulkan backend accumulates matmuls in f16 by default.** Any node left
@@ -242,20 +267,6 @@ had already "passed".
 * **FFN GELU is `approximate='tanh'`** — `ggml_gelu`, not `ggml_gelu_erf`.
 
 ## What is left
-
-### `ref_text` / continuation mode — the one Phase 6 item not done
-
-Supplying a reference transcript alongside reference audio selects a different
-prompt layout upstream: *continuation mode*, with the reference audio in the
-**assistant** channel behind slot 151656 and no closing `audio_end`. The
-pipeline only builds the user-channel layout (`build_reference_audio_block` /
-`build_prompt_grid*` in `src/pipeline.cpp`), so the server **rejects `ref_text`
-with a 400** rather than accepting it and silently cloning from audio alone.
-
-Doing it properly means a second prompt-grid path plus verification. The cheap
-check is the one that has caught every prompt bug so far: diff the generated
-token ids against the reference processor's `build_user_message(...)`, which
-needs no model weights.
 
 ### Do not quantise the SoundEffect backbone
 
