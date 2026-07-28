@@ -310,26 +310,59 @@ std::vector<int32_t> build_prompt_grid_local(const Tokenizer & tok,
 // Feed an (n_tokens, hidden) f32 buffer into libllama via batch.embd.
 // `pos_start` is the position id for the first row.
 // `output_last` controls whether the last row should produce logits.
+//
+// Split across n_batch-sized pieces. This is not an optimisation: libllama
+// asserts `n_tokens_all <= cparams.n_batch` and a failed GGML_ASSERT calls
+// abort(), so oversizing a single batch does not return an error code — it
+// takes the whole process down. A voice-clone reference is caller-supplied and
+// contributes one prompt token per codec frame (12.5 per second of audio), so
+// without this a long enough reference_wav_b64 is a remote kill switch for the
+// server. Found via a 324 s reference: 4113 prompt tokens against the default
+// n_batch of 512.
+//
+// Splitting does change the result for a prompt that spans several batches —
+// different matmul shapes, different summation order, and sampling diverges
+// from there. That is not a regression: those prompts previously aborted the
+// process. A prompt that fits in one batch stays byte-identical, so reference
+// comparisons are unaffected.
 void llama_decode_embeddings(llama_context * ctx,
                              const float *   embds,
                              int32_t         n_tokens,
                              int32_t         hidden,
                              int32_t         pos_start,
                              bool            output_last) {
-    llama_batch batch = llama_batch_init(n_tokens, hidden, /*n_seq_max=*/1);
-    batch.n_tokens = n_tokens;
-    std::memcpy(batch.embd, embds, size_t(n_tokens) * size_t(hidden) * sizeof(float));
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.pos[i]       = pos_start + i;
-        batch.n_seq_id[i]  = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]    = (output_last && i == n_tokens - 1) ? 1 : 0;
+    if (n_tokens <= 0) return;
+
+    const int32_t n_batch = int32_t(llama_n_batch(ctx));
+    if (n_batch <= 0) {
+        throw std::runtime_error("llama_decode_embeddings: llama_n_batch returned "
+                                 + std::to_string(n_batch));
     }
-    int32_t rc = llama_decode(ctx, batch);
-    llama_batch_free(batch);
-    if (rc != 0) {
-        throw std::runtime_error("llama_decode_embeddings: llama_decode returned "
-                                 + std::to_string(rc));
+
+    for (int32_t off = 0; off < n_tokens; off += n_batch) {
+        const int32_t n    = std::min(n_batch, n_tokens - off);
+        const bool    last = (off + n == n_tokens);
+
+        llama_batch batch = llama_batch_init(n, hidden, /*n_seq_max=*/1);
+        batch.n_tokens = n;
+        std::memcpy(batch.embd,
+                    embds + size_t(off) * size_t(hidden),
+                    size_t(n) * size_t(hidden) * sizeof(float));
+        for (int32_t i = 0; i < n; ++i) {
+            batch.pos[i]       = pos_start + off + i;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            // Only the very last row of the whole prompt produces logits.
+            batch.logits[i]    = (output_last && last && i == n - 1) ? 1 : 0;
+        }
+        int32_t rc = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) {
+            throw std::runtime_error("llama_decode_embeddings: llama_decode returned "
+                                     + std::to_string(rc) + " for tokens ["
+                                     + std::to_string(off) + ", "
+                                     + std::to_string(off + n) + ")");
+        }
     }
 }
 
@@ -426,6 +459,37 @@ GenerateResult generate(Model & model,
                 "use the flow-matching entry point instead");
     }
     std::fprintf(stderr, "[generate] prompt_len = %d tokens\n", prompt_len);
+
+    // Chunking the prefill removes the n_batch limit but not the context limit:
+    // the KV cache is sized at load time. Say so here rather than let libllama
+    // fail several seconds later with no indication of which input was at fault.
+    // Reference audio is the usual cause — it costs one prompt token per codec
+    // frame, 12.5 per second of audio, so a few minutes of it fills a default
+    // 8192-token context on its own.
+    {
+        const int32_t n_ctx = int32_t(llama_n_ctx(model.backbone_ctx()));
+        std::string   because;
+        if (T_ref > 0) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          " The %.1fs reference accounts for %d of them.",
+                          double(T_ref) * double(d.downsample_rate) / double(d.sampling_rate),
+                          T_ref);
+            because = buf;
+        }
+        if (prompt_len >= n_ctx) {
+            throw std::runtime_error(
+                "generate: the prompt is " + std::to_string(prompt_len) +
+                " tokens but the context is " + std::to_string(n_ctx) + "." + because +
+                " Shorten the reference audio or raise --n-ctx.");
+        }
+        if (prompt_len + req.max_new_tokens > n_ctx) {
+            std::fprintf(stderr,
+                "[generate] WARNING: prompt (%d) + max_new_tokens (%d) exceeds the context "
+                "(%d); generation will be cut short at %d tokens.%s\n",
+                prompt_len, req.max_new_tokens, n_ctx, n_ctx - prompt_len, because.c_str());
+        }
+    }
 
     // Seed the family's frame decoder from the prompt grid.
     std::vector<std::vector<int32_t>> history;

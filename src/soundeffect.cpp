@@ -151,6 +151,22 @@ std::vector<float> encode_text(Model & model, const std::string & text,
     llama_context * lctx = model.backbone_ctx();
     llama_memory_clear(llama_get_memory(lctx), /*data=*/true);
 
+    // libllama asserts `n_tokens_all <= n_batch`, and a failed GGML_ASSERT calls
+    // abort() — it does not return an error code. Every position's hidden state
+    // is wanted here, so the batch cannot simply be split the way the TTS
+    // prefill is: llama_get_embeddings_ith indexes the last decode's outputs.
+    // Refuse instead. text_max_len caps ids at 512, which equals the default
+    // n_batch, so this only bites when n_batch has been lowered — but it would
+    // take the process down when it did.
+    const int32_t n_batch = int32_t(llama_n_batch(lctx));
+    if (int32_t(ids.size()) > n_batch) {
+        throw std::runtime_error(
+            "encode_text: the prompt is " + std::to_string(ids.size()) +
+            " tokens but n_batch is " + std::to_string(n_batch) +
+            "; raise --n-batch to at least " + std::to_string(d.text_max_len) +
+            " (the model's text_max_len)");
+    }
+
     llama_batch batch = llama_batch_init(int32_t(ids.size()), /*embd=*/0, /*n_seq_max=*/1);
     batch.n_tokens = int32_t(ids.size());
     for (size_t i = 0; i < ids.size(); ++i) {

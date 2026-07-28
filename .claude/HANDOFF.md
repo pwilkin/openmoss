@@ -197,7 +197,15 @@ libllama f16 problem was found, long after the latent comparison had "passed".
    NaN, not inaccuracy: the reciprocal goes to inf while `sin(a*x)^2` underflows
    to zero on those same channels.
 7. **Never infer a projection's absence from matching dimensions.**
-8. **A stream callback must not capture block-scoped locals by reference.**
+8. **A failed `GGML_ASSERT` calls `abort()` — it does not return an error.**
+   `llama_decode` asserts `n_tokens_all <= n_batch`, so submitting an oversized
+   batch kills the process rather than failing the call. That made a
+   caller-supplied `reference_wav_b64` a remote kill switch for the server: a
+   voice-clone reference costs one prompt token per codec frame, 12.5 per
+   second, so ~5.5 minutes of reference audio exceeded the default n_batch of
+   512 and took the whole server down. Fixed by chunking the prefill. Audit any
+   *other* place a caller can influence a batch size the same way.
+9. **A stream callback must not capture block-scoped locals by reference.**
    Three APIs here take one (`StreamCallback`, `SoundEffectProgress`, httplib's
    `DataSink`) and all are invoked *after* the block that built them. The failure
    is not a plausible garbage value: RVO makes the callee's return object alias
