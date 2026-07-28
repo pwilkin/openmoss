@@ -37,6 +37,12 @@ std::vector<uint8_t> encode_wav(const float * pcm,
                                 int32_t       sample_rate,
                                 int32_t       n_channels);
 
+// Just the sample payload: interleaved f32 clamped to [-1, 1] and written as
+// 16-bit little-endian, with no RIFF header. This is exactly what encode_wav()
+// puts after its 44-byte header, exposed separately so a streaming caller can
+// emit chunks before it knows the total length.
+std::vector<uint8_t> encode_pcm_s16le(const float * pcm, int64_t n_samples);
+
 // Decode a WAV byte buffer (in-memory equivalent of read_wav).
 std::vector<float> decode_wav(const uint8_t * data,
                               size_t          n_bytes,

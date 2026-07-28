@@ -22,6 +22,7 @@
 #include "openmoss/frame_decoder.h"
 #include "openmoss/tokenizer.h"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -358,8 +359,6 @@ std::vector<int32_t> debug_build_prompt_grid(Model & model,
 GenerateResult generate(Model & model,
                         const GenerateRequest & req,
                         StreamCallback cb) {
-    (void)cb; // streaming will land alongside chunked codec decode
-
     const auto & d = model.dims();
     const int32_t n_vq    = d.n_vq;
     const int32_t hidden  = d.hidden_size;
@@ -438,6 +437,61 @@ GenerateResult generate(Model & model,
     }
     std::unique_ptr<IFrameDecoder> decoder = make_frame_decoder(model, history);
 
+    // ── 1b. Streaming decode ───────────────────────────────────────────────
+    //
+    // With a callback, the codec runs incrementally alongside generation
+    // instead of once at the end. `result.waveform` is still assembled either
+    // way — a streaming caller usually wants the whole thing too — so the only
+    // thing that changes is *when* the samples exist.
+    //
+    // Both families surface new frames the same way: extract_audio_codes() is
+    // prefix-stable, so whatever it reports beyond what has already been sent is
+    // exactly the new material. That is what makes this work for the delay
+    // pattern, where a frame is not finished until its last codebook has been
+    // sampled n_vq steps later — polling the extractor gets that right without
+    // restating the un-shifting rule here.
+    std::unique_ptr<CodecStreamDecoder> stream;
+    int32_t streamed_frames = 0;
+    double  stream_seconds  = 0.0;
+    if (cb) {
+        if (!model.codec_loaded()) {
+            throw std::runtime_error(
+                "generate: a StreamCallback was supplied but the codec is not loaded "
+                "(skip_codec, or the GGUF was converted without --codec) — there is "
+                "nothing to stream");
+        }
+        stream = std::make_unique<CodecStreamDecoder>(model, n_vq);
+    }
+    const int32_t chunk_frames = std::max(1, req.stream_chunk_frames);
+    std::vector<int32_t> stream_slice;
+
+    // Emit whatever frames have become complete since the last call.
+    auto drain = [&]() {
+        if (!stream) return;
+        int32_t nvq_now = 0, t_now = 0;
+        const auto codes_now = decoder->extract_audio_codes(nvq_now, t_now);
+        const int32_t n = t_now - streamed_frames;
+        if (n <= 0) return;
+        if (nvq_now != n_vq) {
+            throw std::runtime_error("generate: frame decoder reports n_vq=" +
+                                      std::to_string(nvq_now) + " mid-stream, expected " +
+                                      std::to_string(n_vq));
+        }
+        stream_slice.resize(size_t(n_vq) * size_t(n));
+        for (int32_t c = 0; c < n_vq; ++c) {
+            for (int32_t t = 0; t < n; ++t) {
+                stream_slice[size_t(c) * size_t(n) + size_t(t)] =
+                    codes_now[size_t(c) * size_t(t_now) + size_t(streamed_frames + t)];
+            }
+        }
+        const auto t_s = clock_t_::now();
+        const auto pcm = stream->push(stream_slice.data(), n);
+        stream_seconds += seconds_t(clock_t_::now() - t_s).count();
+        streamed_frames = t_now;
+        cb(pcm.data(), int64_t(pcm.size()));
+        result.waveform.insert(result.waveform.end(), pcm.begin(), pcm.end());
+    };
+
     // ── 2. Prefill ─────────────────────────────────────────────────────────
     auto t0 = clock_t_::now();
     auto prefill_embeds = model.compute_input_embeddings(grid.data(), prompt_len);
@@ -479,7 +533,13 @@ GenerateResult generate(Model & model,
                                 /*pos_start=*/pos,
                                 /*output_last=*/true);
         ++pos;
+
+        // Poll on generation steps rather than audio frames: the delay family
+        // spends its first n_vq steps filling the ramp and produces no complete
+        // frame at all, and drain() emits only what is actually ready anyway.
+        if (stream && (step + 1) % chunk_frames == 0) drain();
     }
+    if (stream) drain();   // flush the tail
     result.generate_seconds = seconds_t(clock_t_::now() - t_gen).count();
     std::fprintf(stderr, "[generate] generated %d steps in %.2fs (%.1f tok/s)\n",
                  step, result.generate_seconds, step / std::max(result.generate_seconds, 1e-6));
@@ -500,7 +560,23 @@ GenerateResult generate(Model & model,
 
     // ── 5. Codec decode → waveform ─────────────────────────────────────────
     result.n_channels = d.n_channels;
-    if (t_audio > 0 && model.codec_loaded()) {
+    if (stream) {
+        // Already decoded, chunk by chunk, during the loop above.
+        result.decode_seconds = stream_seconds;
+        if (streamed_frames != t_audio) {
+            std::fprintf(stderr,
+                         "[generate] WARNING: streamed %d frames but the decoder reports %d; "
+                         "the tail may be missing from the stream\n",
+                         streamed_frames, t_audio);
+        }
+        std::fprintf(stderr,
+                     "[generate] streamed %d frames (%.2fs of audio, %d ch) in %.2fs "
+                     "of codec time, %d frames per chunk\n",
+                     streamed_frames,
+                     double(result.waveform.size())
+                         / double(d.sampling_rate) / double(d.n_channels),
+                     d.n_channels, result.decode_seconds, chunk_frames);
+    } else if (t_audio > 0 && model.codec_loaded()) {
         try {
             auto t_dec = clock_t_::now();
             result.waveform = codec_decode(model, codes.data(), nvq_out, t_audio);

@@ -2,9 +2,12 @@
 //
 // One-shot TTS CLI. Loads a GGUF, synthesizes one utterance, writes a WAV.
 
+#include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -41,6 +44,8 @@ struct Args {
     bool flash_attn = true;
     bool skip_codec = false;
     bool aux_cpu    = false;
+    std::optional<int>         stream_chunk;   // frames per incremental decode
+    std::optional<std::string> stream_out;     // raw s16le sink; "-" = stdout
 
     // MOSS-SoundEffect only. It is not autoregressive, so none of the sampling
     // flags above apply; these drive the flow-matching solver instead.
@@ -93,6 +98,20 @@ struct Args {
         "  --aux-cpu              Force audio embeds + codec onto CPU (workaround\n"
         "                         for backends missing ops, e.g. Metal DIAG_MASK_INF).\n"
         "                         Backbone still uses the GPU.\n"
+        "\n"
+        "Streaming (autoregressive families only; MOSS-SoundEffect refines the whole\n"
+        "latent at once and has no prefix to emit):\n"
+        "  --stream [N]           Decode incrementally, N frames at a time (default 8).\n"
+        "                         A frame is 80 ms, so N is the output granularity.\n"
+        "                         The decode runs inline with generation, so small N\n"
+        "                         costs throughput: 8 gives 0.64s chunks at ~1.46x real\n"
+        "                         time against 1.74x for one batch decode at the end.\n"
+        "                         The WAV written at exit is identical either way.\n"
+        "  --stream-out PATH      Also write each chunk as raw 16-bit little-endian PCM\n"
+        "                         as it arrives; '-' means stdout. Implies --stream.\n"
+        "                         Pipe it to a player to hear the latency directly:\n"
+        "                           --stream-out - | aplay -f S16_LE -r 48000 -c 2\n"
+        "                         (use -r 24000 -c 1 for the delay family)\n"
         "\n"
         "MOSS-SoundEffect only (the model is a diffusion transformer, not an\n"
         "autoregressive one, so the sampling flags above do not apply). --text\n"
@@ -169,6 +188,15 @@ int main(int argc, char ** argv) {
         else if (k == "--main-gpu")        a.main_gpu     = require_int(i, argc, argv);
         else if (k == "--n-batch")         a.n_batch      = require_int(i, argc, argv);
         else if (k == "--n-ctx")           a.n_ctx        = require_int(i, argc, argv);
+        else if (k == "--stream") {
+            // Optional count: only swallow the next token when it is one.
+            if (i + 1 < argc && std::isdigit(static_cast<unsigned char>(argv[i + 1][0]))) {
+                a.stream_chunk = std::atoi(argv[++i]);
+            } else {
+                a.stream_chunk = 8;
+            }
+        }
+        else if (k == "--stream-out")      a.stream_out = require_str(i, argc, argv);
         else if (k == "--no-flash-attn")   a.flash_attn = false;
         else if (k == "--skip-codec")      a.skip_codec = true;
         else if (k == "--aux-cpu")         a.aux_cpu    = true;
@@ -298,7 +326,59 @@ int main(int argc, char ** argv) {
                                                dims.n_channels);
     }
 
-    auto result = openmoss::generate(*model, req);
+    // Streaming: decode alongside generation and report when audio first exists.
+    // That number is the whole point of the feature — the total is unchanged.
+    openmoss::StreamCallback scb;
+    FILE * stream_file = nullptr;
+    // These outlive the block that builds the callback — it captures by
+    // reference and is not invoked until generate() runs.
+    auto    stream_t0    = std::chrono::steady_clock::now();
+    int64_t stream_total = 0;
+    bool    stream_first = true;
+    if (a.stream_out && !a.stream_chunk) a.stream_chunk = 8;
+    if (a.stream_chunk) {
+        if (*a.stream_chunk < 1) {
+            std::fprintf(stderr, "--stream needs a positive frame count\n");
+            return 2;
+        }
+        req.stream_chunk_frames = *a.stream_chunk;
+        if (a.stream_out) {
+            if (*a.stream_out == "-") {
+                stream_file = stdout;
+            } else {
+                stream_file = std::fopen(a.stream_out->c_str(), "wb");
+                if (!stream_file) {
+                    std::fprintf(stderr, "cannot open %s\n", a.stream_out->c_str());
+                    return 1;
+                }
+            }
+        }
+        stream_t0 = std::chrono::steady_clock::now();
+        scb = [&](const float * pcm, int64_t n_samples) {
+            const double at = std::chrono::duration<double>(
+                                  std::chrono::steady_clock::now() - stream_t0).count();
+            if (stream_first) {
+                std::fprintf(stderr, "[stream] first audio after %.2fs\n", at);
+                stream_first = false;
+            }
+            stream_total += n_samples;
+            if (stream_file) {
+                const auto bytes = openmoss::encode_pcm_s16le(pcm, n_samples);
+                std::fwrite(bytes.data(), 1, bytes.size(), stream_file);
+                std::fflush(stream_file);
+            }
+            // Audio produced so far, against the wall-clock spent producing it.
+            const double have = double(stream_total)
+                              / double(dims.sampling_rate) / double(dims.n_channels);
+            std::fprintf(stderr, "\r[stream] %6.2fs of audio in %6.2fs (%.2fx real time)",
+                         have, at, have / (at > 0 ? at : 1));
+            std::fflush(stderr);
+        };
+    }
+
+    auto result = openmoss::generate(*model, req, scb);
+    if (a.stream_chunk) std::fprintf(stderr, "\n");
+    if (stream_file && stream_file != stdout) std::fclose(stream_file);
 
     if (a.dump_codes) {
         FILE * f = std::fopen(a.dump_codes->c_str(), "w");

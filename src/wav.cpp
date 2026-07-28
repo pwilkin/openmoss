@@ -213,6 +213,18 @@ std::vector<float> read_wav_mono(const std::string & path, int32_t target_sr) {
     return read_wav(path, target_sr, 1);
 }
 
+std::vector<uint8_t> encode_pcm_s16le(const float * pcm, int64_t n_samples) {
+    if (n_samples < 0) n_samples = 0;
+    std::vector<uint8_t> out(size_t(n_samples) * 2);
+    for (int64_t i = 0; i < n_samples; ++i) {
+        float v = pcm[i];
+        v = std::max(-1.0f, std::min(1.0f, v));
+        const int16_t s = int16_t(std::lround(v * 32767.0f));
+        write_u16_le(out.data() + i * 2, uint16_t(s));
+    }
+    return out;
+}
+
 std::vector<uint8_t> encode_wav(const float * pcm,
                                 int64_t       n_samples,
                                 int32_t       sample_rate,
@@ -241,13 +253,8 @@ std::vector<uint8_t> encode_wav(const float * pcm,
     std::memcpy(hdr + 36, "data", 4);
     write_u32_le(hdr + 40, data_bytes);
 
-    uint8_t * sp = out.data() + 44;
-    for (int64_t i = 0; i < n_samples; ++i) {
-        float v = pcm[i];
-        v = std::max(-1.0f, std::min(1.0f, v));
-        const int16_t s = int16_t(std::lround(v * 32767.0f));
-        write_u16_le(sp + i * 2, uint16_t(s));
-    }
+    const auto payload = encode_pcm_s16le(pcm, n_samples);
+    std::memcpy(out.data() + 44, payload.data(), payload.size());
     return out;
 }
 

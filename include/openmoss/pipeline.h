@@ -34,6 +34,18 @@ struct GenerateRequest {
     std::optional<int>                tokens;          // duration hint (1s ≈ 12.5 tokens)
     int                               max_new_tokens = 4096;
     SamplingConfig                    sampling;
+
+    // How many audio frames to accumulate before handing them to the codec,
+    // when a StreamCallback is supplied. Ignored otherwise.
+    //
+    // A frame is 80 ms of audio, so this is the output granularity. It is also
+    // the throughput/latency dial: an incremental decode costs ~50 ms of fixed
+    // overhead plus its own compute, and that runs inline with generation, so
+    // small chunks stall the LM more often. Measured on a Radeon 8060S with
+    // MOSS-TTS-Local Q8 — 8 frames gives 0.64 s granularity at ~1.46x real time
+    // against 1.74x for a batch decode; 32 frames recovers most of the
+    // throughput at 2.56 s granularity.
+    int                               stream_chunk_frames = 8;
 };
 
 struct GenerateResult {
