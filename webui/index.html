@@ -20,11 +20,11 @@
       <h2>Generate</h2>
 
       <label class="field">
-        <span class="field-label">Text</span>
+        <span class="field-label" id="promptLabel">Text</span>
         <textarea id="text" rows="5" placeholder="Type the utterance to synthesize…" required></textarea>
       </label>
 
-      <div class="row">
+      <div class="row tts-only">
         <label class="field">
           <span class="field-label">Voice instruction <span class="hint">(optional)</span></span>
           <input id="instruction" type="text" placeholder='e.g. "a calm female voice"' />
@@ -39,7 +39,7 @@
         </label>
       </div>
 
-      <div class="row">
+      <div class="row tts-only">
         <label class="field">
           <span class="field-label">Reference WAV <span class="hint">(voice cloning, optional)</span></span>
           <input id="reference" type="file" accept="audio/wav,audio/x-wav,audio/*" />
@@ -50,7 +50,7 @@
         </label>
       </div>
 
-      <details class="advanced">
+      <details class="advanced tts-only">
         <summary>Advanced sampling</summary>
         <div class="grid">
           <label class="field"><span class="field-label">text_temperature</span><input id="text_temperature" type="number" step="0.05" /></label>
@@ -61,6 +61,30 @@
           <label class="field"><span class="field-label">audio_top_k</span><input id="audio_top_k" type="number" step="1" min="0" /></label>
           <label class="field"><span class="field-label">audio_repetition_penalty</span><input id="audio_repetition_penalty" type="number" step="0.05" /></label>
           <label class="field"><span class="field-label">seed</span><input id="seed" type="number" step="1" placeholder="random" /></label>
+        </div>
+      </details>
+
+      <div class="row sfx-only">
+        <label class="field field-narrow">
+          <span class="field-label">Seconds</span>
+          <input id="sfx_seconds" type="number" step="0.1" min="0.1" value="10" />
+        </label>
+        <label class="field field-narrow">
+          <span class="field-label">Steps <span class="hint">(2 DiT passes each)</span></span>
+          <input id="sfx_steps" type="number" step="1" min="1" value="100" />
+        </label>
+        <label class="field field-narrow">
+          <span class="field-label">CFG scale <span class="hint">(1 = half the work)</span></span>
+          <input id="sfx_cfg_scale" type="number" step="0.5" min="1" value="4" />
+        </label>
+      </div>
+
+      <details class="advanced sfx-only">
+        <summary>Advanced</summary>
+        <div class="grid">
+          <label class="field"><span class="field-label">sigma_shift</span><input id="sfx_sigma_shift" type="number" step="0.5" placeholder="5.0" /></label>
+          <label class="field"><span class="field-label">seed</span><input id="sfx_seed" type="number" step="1" min="0" placeholder="0" /></label>
+          <label class="field"><span class="field-label">negative_prompt</span><input id="sfx_negative_prompt" type="text" placeholder="(empty — what it was trained on)" /></label>
         </div>
       </details>
 

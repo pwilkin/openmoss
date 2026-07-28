@@ -1,4 +1,10 @@
-// openmoss TTS WebUI — vanilla JS, IndexedDB-backed history.
+// openmoss WebUI — vanilla JS, IndexedDB-backed history.
+//
+// One server loads one model, so the form adapts to whichever family that is.
+// The architecture comes from /info and drives both which controls are visible
+// (via <body data-arch> and a couple of CSS rules) and which endpoint is used:
+// /tts for the two autoregressive families, /sfx for MOSS-SoundEffect, which is
+// a diffusion model and shares none of the sampling knobs.
 
 const DB_NAME = "openmoss-tts";
 const DB_VERSION = 1;
@@ -117,6 +123,36 @@ async function blobDuration(blob) {
   });
 }
 
+
+// ── Which family is loaded ─────────────────────────────────────────────────
+let ARCH = null;
+
+function isSfx() { return ARCH === "moss_soundeffect"; }
+
+// Called once /info answers. Sets the attribute the CSS keys off, retitles the
+// prompt field, and seeds the duration ceiling from the model rather than a
+// hardcoded 30.
+function applyArch(info) {
+  if (ARCH === info.architecture) return;
+  ARCH = info.architecture || null;
+  if (ARCH) document.body.dataset.arch = ARCH;
+  const label = $("promptLabel");
+  if (label) label.textContent = isSfx() ? "Sound description" : "Text";
+  const ta = $("text");
+  if (ta) {
+    ta.placeholder = isSfx()
+      ? "Describe a sound… e.g. \"a dog barking twice\""
+      : "Type the utterance to synthesize…";
+  }
+  const secs = $("sfx_seconds");
+  if (secs && info.max_seconds) {
+    secs.max = info.max_seconds;
+    // The server rounds to one decimal, so match that here.
+    if (Number(secs.value) > info.max_seconds) secs.value = info.max_seconds;
+  }
+  document.title = isSfx() ? "openmoss SoundEffect" : "openmoss TTS";
+}
+
 // ── Server status ─────────────────────────────────────────────────────────
 async function refreshStatus() {
   const el = $("status");
@@ -124,8 +160,12 @@ async function refreshStatus() {
     const r = await fetch("/info");
     if (!r.ok) throw new Error("HTTP " + r.status);
     const info = await r.json();
-    const rate = info.frame_rate_hz ? info.frame_rate_hz.toFixed(1) + " Hz" : "?";
-    el.textContent = `model loaded · ${info.sampling_rate} Hz · codec ${info.codec_loaded ? "on" : "off"} · ${info.requests_served} served`;
+    applyArch(info);
+    const ch = info.n_channels === 2 ? "stereo" : "mono";
+    const tail = isSfx()
+      ? `up to ${info.max_seconds}s`
+      : `codec ${info.codec_loaded ? "on" : "off"}`;
+    el.textContent = `${info.architecture} · ${info.sampling_rate} Hz ${ch} · ${tail} · ${info.requests_served} served`;
     el.className = "status ok";
   } catch (e) {
     el.textContent = "server unreachable";
@@ -136,7 +176,25 @@ async function refreshStatus() {
 // ── Generation ─────────────────────────────────────────────────────────────
 async function buildRequestBody() {
   const text = $("text").value.trim();
-  if (!text) throw new Error("text is required");
+  if (!text) throw new Error(isSfx() ? "a sound description is required" : "text is required");
+
+  if (isSfx()) {
+    const body = { prompt: text };
+    const seconds = readNum("sfx_seconds");
+    if (seconds !== undefined) body.seconds = seconds;
+    const steps = readNum("sfx_steps");
+    if (steps !== undefined) body.steps = steps;
+    const cfg = readNum("sfx_cfg_scale");
+    if (cfg !== undefined) body.cfg_scale = cfg;
+    const shift = readNum("sfx_sigma_shift");
+    if (shift !== undefined) body.sigma_shift = shift;
+    // 0 is a real seed here, not "unset", so only an empty field omits it.
+    const seed = readNum("sfx_seed");
+    if (seed !== undefined) body.seed = seed;
+    const neg = $("sfx_negative_prompt").value.trim();
+    if (neg) body.negative_prompt = neg;
+    return body;
+  }
 
   const body = { text };
   const instruction = $("instruction").value.trim();
@@ -183,7 +241,7 @@ async function generate() {
   const t0 = performance.now();
 
   try {
-    const r = await fetch("/tts", {
+    const r = await fetch(isSfx() ? "/sfx" : "/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -195,20 +253,31 @@ async function generate() {
     const blob = await r.blob();
     const duration = await blobDuration(blob);
 
+    // The two families report different timings: TTS has a generate phase and
+    // an audio-frame count, SoundEffect has a solve phase and a latent length.
     const record = {
       createdAt: Date.now(),
-      text: body.text,
+      arch: ARCH,
+      text: body.text || body.prompt,
       instruction: body.instruction || null,
       language: body.language || null,
       sampling: body.sampling || null,
       maxNewTokens: body.max_new_tokens || null,
       hasReference: !!body.reference_wav_b64,
+      sfx: isSfx() ? {
+        seconds: body.seconds ?? null,
+        steps: body.steps ?? null,
+        cfgScale: body.cfg_scale ?? null,
+        seed: body.seed ?? null,
+      } : null,
       durationSeconds: duration,
       bytes: blob.size,
       wav: blob,
-      genSeconds: Number(r.headers.get("X-MOSS-Generate-Seconds")) || null,
+      genSeconds: Number(r.headers.get("X-MOSS-Generate-Seconds"))
+               || Number(r.headers.get("X-MOSS-Solve-Seconds")) || null,
       decodeSeconds: Number(r.headers.get("X-MOSS-Decode-Seconds")) || null,
-      frames: Number(r.headers.get("X-MOSS-Audio-Frames")) || null,
+      frames: Number(r.headers.get("X-MOSS-Audio-Frames"))
+           || Number(r.headers.get("X-MOSS-Latent-Frames")) || null,
     };
     await dbAdd(record);
     await renderHistory();

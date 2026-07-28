@@ -256,3 +256,14 @@ button.icon {
   border: 1px dashed var(--border);
   border-radius: 8px;
 }
+
+/* ── Family-specific controls ───────────────────────────────────────────────
+   One binary serves all three MOSS families and the server loads exactly one
+   model, so the form shows only the controls that apply. The architecture comes
+   from /info and lands on <body data-arch>; until it does, neither set shows,
+   which avoids a flash of the wrong fields. */
+body:not([data-arch]) .tts-only,
+body:not([data-arch]) .sfx-only { display: none; }
+body[data-arch="moss_soundeffect"] .tts-only { display: none; }
+body[data-arch="moss_tts_delay"]  .sfx-only,
+body[data-arch="moss_tts_local"]  .sfx-only { display: none; }
