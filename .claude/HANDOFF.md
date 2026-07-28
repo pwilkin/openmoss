@@ -2,7 +2,7 @@
 
 Branch: `feat/moss-tts-local` (off `main`). Everything below is committed.
 
-> **The branch has never been pushed.** All 22 commits exist only on this disk,
+> **The branch has never been pushed.** All 25 commits exist only on this disk,
 > and `origin` still has just `main` at 64eabe0 (July 11). That is the single
 > most important operational fact here.
 
@@ -18,8 +18,10 @@ PyTorch reference at every seam. MOSS-SoundEffect is published at
 | MOSS-TTS-Local-Transformer-v1.5 | `moss_tts_local` | 48 kHz stereo | done, incl. voice clone + continuation |
 | MOSS-SoundEffect-v2.0 | `moss_soundeffect` | 48 kHz mono | done, published |
 
-Only one substantial thing is left: **streaming**, which is designed but not
-built. See [docs/STREAMING.md](../docs/STREAMING.md).
+**Streaming now works too** — per-stage KV cache in the codec, `--stream` in the
+CLI, chunked transfer in the server. See
+[docs/STREAMING.md](../docs/STREAMING.md). Nothing substantial is outstanding;
+what remains is the short list at the end of this document.
 
 ## Where everything lives
 
@@ -52,6 +54,14 @@ Build: `cmake -B build -DGGML_VULKAN=ON && cmake --build build -j`
 
 # server (one model per server; /tts or /sfx applies, the other 400s)
 ./build/moss-tts-server --model <gguf> --port 8080
+
+# streaming: hear it arrive rather than waiting for the file
+./build/moss-tts-cli --model .../moss-tts-local-1.5-q8_0.gguf \
+  --text "..." --stream 8 --stream-out - --output out.wav | aplay -f S16_LE -r 48000 -c 2
+
+# same over HTTP; requires pcm, since a RIFF header needs a length up front
+curl -N -X POST localhost:8080/tts -H 'Content-Type: application/json' \
+  -d '{"text":"...","response_format":"pcm","stream":true}'
 ```
 
 **Use `--vk-f32` on Vulkan** for MOSS-SoundEffect. It sets
@@ -97,6 +107,7 @@ R=/devel/models/models/openmoss-ref
 ./build/moss-sfx-vae-probe   <sfx.gguf> $R/ref_vae  [_t40]   # DAC decoder, 10 seams
 ./build/moss-prompt-probe    <tts.gguf> "<text>" $R/pp_codes.txt ["<ref_text>"]
 ./build/moss-codec-causality <tts.gguf> $R/codes_causality.txt
+./build/moss-codec-stream    <tts.gguf> $R/codes_long.txt [chunk ...]
 ./build/moss-local-probe     <tts.gguf> <hidden.f32>
 ./build/moss-codec-roundtrip <tts.gguf> <in.wav> <out.wav>
 ```
@@ -105,6 +116,15 @@ All verified working from the durable path. Env knobs: `MOSS_AUX_CPU=1` reruns
 on the CPU backend, which separates a graph error from a backend numerics
 difference; `MOSS_SEAM_TOL=F` raises the per-seam budget for a quantised sidecar
 (Q8_0 sits around 5e-3).
+
+`moss-codec-stream` has a structure worth copying for any cached-attention work:
+it runs the *whole* utterance as one push first, which must come back
+**bit-identical** to the batch decode. That pins the streaming graph to the batch
+graph, so a chunked run that then drifts can only be the cache. Without that
+control, a 1e-3 chunked error is uninterpretable — it could be either. And the
+signal to watch in the chunked runs is not the magnitude but the *slope*: a
+too-short cache is clean at the start and degrades once the window fills, so
+flat error across 853 frames is the actual proof.
 
 `moss-prompt-probe` is the cheapest check in the repo — prompt ids have no
 numerical tolerance, and it needs neither the codec nor the backbone. All three
@@ -133,6 +153,15 @@ For scale: the same latent shifted 0.74 s correlates at 0.90, unrelated noise at
 0.06. Quantisation makes every *seam* 6-10x worse yet leaves the demeaned output
 identical — weight-rounding error is almost entirely frame-constant, and the
 head discards exactly that component.
+
+Streaming, against a batch decode of the same codes:
+
+| check | result |
+|---|---|
+| one single push, both codec generations | **bit-identical** |
+| chunked, 853 frames, chunk 1 / 8 / 32 / 128 | 1.44 / 1.60 / 1.35 / 1.23e-3, and *flat* along the utterance |
+| end to end `moss_tts_local`, fixed seed | identical codes; 3.5e-3, corr 0.99999398 |
+| end to end `moss_tts_delay`, fixed seed | identical codes; 6.7e-4, corr 0.99999978 |
 
 **What `latent_final` does not prove.** The guidance signal
 `rms(vpos-vneg)/rms(vpos)` starts at 23% and decays under 1% within a few steps,
@@ -167,7 +196,14 @@ libllama f16 problem was found, long after the latent comparison had "passed".
    NaN, not inaccuracy: the reciprocal goes to inf while `sin(a*x)^2` underflows
    to zero on those same channels.
 7. **Never infer a projection's absence from matching dimensions.**
-8. **Do not quantise the SoundEffect backbone.** Tested: Q8_0 moves the
+8. **A stream callback must not capture block-scoped locals by reference.**
+   Three APIs here take one (`StreamCallback`, `SoundEffectProgress`, httplib's
+   `DataSink`) and all are invoked *after* the block that built them. The failure
+   is not a plausible garbage value: RVO makes the callee's return object alias
+   the caller's dead stack slots, so writing to a dangling counter corrupts the
+   `std::vector` being appended to and it surfaces as `std::bad_alloc` inside
+   libstdc++, with a backtrace pointing at the wrong function entirely.
+9. **Do not quantise the SoundEffect backbone.** Tested: Q8_0 moves the
    conditioning to 2.7e-2 and the latent to 1.8e-1, corr 0.984. A text encoder
    consumed as a continuous conditioning vector has no sampling stage to absorb
    the error. f16 vs the source bf16 is *not* a compromise — bf16 has 7 mantissa
@@ -190,34 +226,38 @@ libllama f16 problem was found, long after the latent comparison had "passed".
 * Continuation mode replaces the reference block with the literal text `"None"`
   and puts the codes at the end in the assistant channel, with no `audio_end`.
 
-## What is left
+## Streaming, as built
 
-### Streaming — designed, not built
+[docs/STREAMING.md](../docs/STREAMING.md) is the full account. What matters here:
 
-[docs/STREAMING.md](../docs/STREAMING.md) has the full analysis. The codec
-decoder *is* causal, but its six stages are banded at 10+10+8+4+2+1 s and those
-windows **add**, so a chunk needs 35 s of history. Measured: at 128 frames
-(10.2 s) the error is 1.144 — larger than the signal; it converges only past
-512 frames (8.7e-3). Emitting 1 s chunks statelessly costs 36x the work, which
-at the codec's ~30x real time cannot keep up.
+Each codec stage keeps the `context - 1` positions its next queries can reach,
+on the host, handed to each push's graph as an input — `src/local_transformer.cpp`
+is the same trade. The batch path is untouched: the attention plan just gained
+`q_origin`/`k_origin`, both 0 there. Both codec generations verified.
 
-**Per-stage KV caching is the architecture.** `src/local_transformer.cpp` is the
-pattern (host-side cache handed to each step's graph as an input, so no in-graph
-mutation). Caches total 44.3 M floats. The LM at 1.74x real time, not the codec
-at 30x, is the ceiling — so the win is latency (first audio ~0.5 s instead of
-5.2 s), not throughput, and `pipeline.h` already has an unused `StreamCallback`
-for the LM half.
+Two numbers to hold onto. **Streaming buys latency and spends throughput**:
+first audio 2.54 s → 0.57 s at the default 8-frame chunk, for +31% total time,
+because the decode now runs inline with generation. The knee is at 16 frames
+(+7%, 0.83 s) — below it the fixed per-push cost starts to dominate. And **the
+delay family is the awkward one**: its 32-step ramp means no frame completes for
+32 steps, and it generates at ~0.9x real time, so a client there should buffer
+rather than play straight through.
 
-MOSS-SoundEffect cannot stream at all: flow matching refines all 1500 latent
-frames simultaneously. Progress over SSE is the only thing worth exposing, and
+MOSS-SoundEffect still cannot stream — flow matching refines all 1500 latent
+frames simultaneously — and all three endpoints now say so rather than ignoring
+the flag. Progress over SSE remains the only thing worth exposing there;
 `generate_sound_effect()` already takes a callback.
 
-### Smaller
+## What is left
 
 * Continuation mode for `moss_tts_delay` — different slot layout, no verified
   reference locally, so `ref_text` is rejected for it rather than ignored.
-* Server concurrency — one mutex serialises generation.
-* The `main` branch is 11 commits behind this one and this branch is unpushed.
+* Server concurrency — one mutex serialises generation. Streaming makes this
+  more visible: a streamed request holds the lock for its whole duration.
+* The WebUI does not use streaming; it still posts and waits.
+* README drift predating this work — the endpoint list omits `/sfx`, and several
+  option descriptions still assume 24 kHz mono.
+* The `main` branch is 14 commits behind this one and this branch is unpushed.
 
 ## Listening to output
 

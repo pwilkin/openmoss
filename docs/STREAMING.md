@@ -128,8 +128,34 @@ measures at ~1e-3 for a prefix decode: the batch path splits queries at
 `ATTN_CHUNK`, the stream splits them at chunk boundaries, and flash attention
 sums a different partition of identical terms.
 
-End to end, a 51-frame utterance at a fixed seed produces **identical codes** and
-a waveform at rel 3.5e-3, correlation 0.99999398, against the batch decode.
+End to end, at a fixed seed, both families produce **identical codes** streamed
+or not — only the codec path differs:
+
+| family | frames | rel | correlation |
+|---|---|---|---|
+| `moss_tts_local` (48 kHz stereo, 6 stages) | 51 | 3.5e-3 | 0.99999398 |
+| `moss_tts_delay` (24 kHz mono, 4 stages) | 44 | 6.7e-4 | 0.99999978 |
+
+## The delay family streams, but not comfortably
+
+Worth knowing before pointing a player at it. Two things work against
+`moss_tts_delay` that do not affect MOSS-TTS-Local:
+
+**The ramp delays the first frame.** Codebook *i* is staggered *i* steps behind
+codebook 0, so no frame is complete until `n_vq` steps have run — 32 of them.
+A measured run spent 78 steps producing 44 audio frames, and first audio landed
+at 2.03 s against 3.55 s for the batch path. Still a win, but a much smaller one
+than the local family's 0.57 s against 2.54 s.
+
+**It generates at roughly real time.** That same run produced 3.52 s of audio in
+3.93 s — 0.90x. A player started at first audio would slowly fall behind and
+eventually starve, so a client for this family should buffer rather than play
+straight through. MOSS-TTS-Local has real headroom by comparison, delivering
+4.8 s of audio in 3.3 s.
+
+`drain()` handles the ramp without knowing about it: polling is driven off
+generation steps, and `extract_audio_codes()` reports only frames whose last
+codebook has actually been sampled.
 
 ## What it costs
 
