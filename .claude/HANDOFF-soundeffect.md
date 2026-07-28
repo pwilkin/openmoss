@@ -15,6 +15,10 @@ continuation mode.
 ## Commits on this branch
 
 ```
+5d77b51  feat(webui): MOSS-SoundEffect mode
+5e515d2  docs: streaming design pass, and refresh STATUS.md
+726c811  perf(sfx): cache the graphs on Model, and decode only the latent needed
+fc6cf47  fix(codec): accumulate the codec's matmuls in f32
 7810fce  feat(tts): continuation mode (ref_text) for MOSS-TTS-Local
 c68148b  feat(server): Phase 6 — SoundEffect endpoint and option-surface parity
 a1fae1c  docs: refresh the MOSS-SoundEffect handoff
@@ -284,24 +288,26 @@ exponent fits. Across all 2.03 B text-encoder weights none overflow, 0.157% land
 in f16's subnormal range and 1578 flush to zero, for a measured round-trip error
 of **4.7e-9** — five orders of magnitude below what compute precision costs.
 
-### Streaming
+### Streaming — designed, not built
 
-Still needs its own design pass. The TTS codec's summed receptive field is 35 s,
-so block decode with warm-up is not viable and it wants per-stage KV caching.
-SoundEffect cannot stream at all in the usual sense — the solver only produces a
-usable latent after the last step.
+See [docs/STREAMING.md](../docs/STREAMING.md). The conclusion, with measured
+numbers: the codec decoder *is* causal, but its six stages are banded at
+10+10+8+4+2+1 s and those windows add, so a chunk needs 35 s of history. At
+`W = 128` frames the error is larger than the signal (1.144); it only converges
+past 512 frames (8.7e-3). Emitting 1 s chunks statelessly costs 36x the work,
+which at the codec's ~30x real time cannot keep up. **Per-stage KV caching is the
+architecture**; `src/local_transformer.cpp` is the pattern, the caches total
+44.3 M floats, and the LM at 1.74x real time — not the codec at 30x — is the real
+ceiling. MOSS-SoundEffect cannot stream at all: flow matching refines all 1500
+latent frames simultaneously.
 
 ### Smaller things
 
-* `generate_sound_effect()` constructs `DiTGraph` and `DacDecoder` per call, and
-  the latter materialises ~300 MB of f32 kernels each time. Fine for a one-shot
-  CLI, wasteful for a server — cache them on `Model` the way `Model::codec()`
-  does.
-* `docs/STATUS.md` still describes only the delay family; it predates both
-  MOSS-TTS-Local and this work.
-* The WebUI (`webui/`) has no SoundEffect mode — it posts to `/tts`, which now
-  answers 400 for this family. `/sfx` and the arch in `/info` are what it would
-  key off.
+* Continuation mode for `moss_tts_delay` (different slot layout, no verified
+  reference locally; `ref_text` is rejected for it rather than ignored).
+* Server concurrency — one mutex serialises generation.
+* Progress over SSE for `/sfx`, since a 100-step run is ~90 s of silence and
+  `generate_sound_effect()` already takes a progress callback.
 
 ## Listening to output
 
