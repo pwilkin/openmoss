@@ -1005,7 +1005,10 @@ def write_moss_sidecar(out_gguf: Path,
     # feed inf into the decoder and corrupt the waveform silently.
     audio_count = 0
     quant_count = 0
+    n_audio_embed = 0
     for name, arr in fam.collect_extras(moss_dir, moss_config):
+        if name.startswith("moss.audio_embed."):
+            n_audio_embed += 1
         qtype = _sidecar_quant_type(name, arr, sidecar_quant)
         if qtype is not None:
             from gguf import quants
@@ -1021,6 +1024,26 @@ def write_moss_sidecar(out_gguf: Path,
         audio_count += 1
     log.info("added %d MOSS audio/head tensors (%d quantised to %s)",
              audio_count, quant_count, sidecar_quant.name if sidecar_quant else "none")
+
+    # Cross-check the n_vq we wrote against what the checkpoint actually carried.
+    #
+    # n_vq comes from the model's own config with a per-family fallback, so a
+    # checkpoint whose config omits the key silently inherits the family's — and
+    # for moss_tts_delay that fallback is 32. MOSS-VoiceGenerator is in that
+    # family but ships fewer codebooks, so it would be labelled 32.
+    #
+    # Nothing downstream fails loudly on that. The server's MOSS-VoiceGenerator
+    # length bound is gated on `n_vq < 32` precisely because that model has no
+    # reference audio to anchor its length; mislabelled as 32 it gets no bound at
+    # all and generates until max_new_tokens — minutes of audio from a one-line
+    # prompt. Catch it here, where the fix is obvious, rather than there.
+    if n_vq and n_audio_embed and n_audio_embed != n_vq:
+        raise SystemExit(
+            f"n_vq mismatch: the GGUF would say moss.n_vq={n_vq} but the checkpoint "
+            f"carries {n_audio_embed} audio embedding tables. n_vq came from "
+            f"{'config.json' if 'n_vq' in moss_config else f'the {fam.arch} default'}. "
+            f"Set n_vq={n_audio_embed} in the model's config.json, or pass the right "
+            f"--arch.")
 
     # ── 3. add codec tensors (optional) ────────────────────────────────────
     if codec_dir is not None:
