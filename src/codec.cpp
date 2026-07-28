@@ -140,6 +140,21 @@ std::vector<StageSpec> stages_for(int codec_version, bool decoder) {
     }
 }
 
+// Every matmul here accumulates in f32.
+//
+// ggml's Vulkan backend picks an f16-accumulate pipeline whenever a node is left
+// at GGML_PREC_DEFAULT, which over these dot products costs ~1e-2 relative on the
+// decoded waveform — sixteen times what f32 accumulation gives, and far more than
+// the f16 weights themselves contribute. It hides well because matrix-*vector*
+// products take a different, f32-accumulating path, so the audio heads and the
+// depth transformer (which run one token at a time) are unaffected and only this
+// file, which pushes thousands of frames through 68 transformer layers, suffers.
+ggml_tensor * mm_(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x) {
+    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+    ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    return y;
+}
+
 // f16 representation helpers (we store everything as f16 on the backend).
 inline uint16_t f32_to_f16_bits(float f) {
     uint32_t u; std::memcpy(&u, &f, 4);
@@ -700,7 +715,7 @@ ggml_tensor * CodecGraphs::build_attention_(ggml_context * gctx,
     const int head_dim = d_model / n_heads;
     const int T        = int(x->ne[1]);
 
-    ggml_tensor * qkv = ggml_mul_mat(gctx, L.attn_in, x);   // (3*d_model, T)
+    ggml_tensor * qkv = mm_(gctx, L.attn_in, x);   // (3*d_model, T)
 
     const size_t e        = ggml_type_size(qkv->type);
     const size_t row_size = size_t(head_dim) * e;
@@ -782,16 +797,16 @@ ggml_tensor * CodecGraphs::build_attention_(ggml_context * gctx,
     attn = ggml_reshape_2d(gctx, attn, d_model, T);
 
     // output projection
-    attn = ggml_mul_mat(gctx, L.attn_out, attn);   // (d_model, T)
+    attn = mm_(gctx, L.attn_out, attn);   // (d_model, T)
     return attn;
 }
 
 ggml_tensor * CodecGraphs::build_ffn_(ggml_context * gctx,
                                        ggml_tensor * x,
                                        const Layer & L) const {
-    ggml_tensor * y = ggml_mul_mat(gctx, L.linear1, x);
+    ggml_tensor * y = mm_(gctx, L.linear1, x);
     y = ggml_gelu(gctx, y);
-    y = ggml_mul_mat(gctx, L.linear2, y);
+    y = mm_(gctx, L.linear2, y);
     return y;
 }
 
@@ -823,11 +838,11 @@ ggml_tensor * CodecGraphs::build_stage_(ggml_context * gctx,
                                          const Stage & S,
                                          ggml_tensor * pos,
                                          const AttnPlan & plan) const {
-    if (S.iproj) x = ggml_mul_mat(gctx, S.iproj, x);
+    if (S.iproj) x = mm_(gctx, S.iproj, x);
     for (const Layer & L : S.layers) {
         x = build_layer_(gctx, x, L, S.spec.d_model, S.spec.n_heads, pos, plan);
     }
-    if (S.oproj) x = ggml_mul_mat(gctx, S.oproj, x);
+    if (S.oproj) x = mm_(gctx, S.oproj, x);
     return x;
 }
 
@@ -1036,12 +1051,12 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
         // (codebook_dim=8, T) via embedding lookup → f32 (get_rows promotes)
         ggml_tensor * z = ggml_get_rows(gctx, m_codebook[i], codes_in[i]);
         // Conv1d 8 → 512 (kernel=1). w stored as (in=8, out=512) f16.
-        z = ggml_mul_mat(gctx, m_q_oproj_w[i], z);                   // (512, T) f32
+        z = mm_(gctx, m_q_oproj_w[i], z);                   // (512, T) f32
         z = ggml_add(gctx, z, to_f32_(gctx, m_q_oproj_b[i]));        // broadcast bias
         sum = sum ? ggml_add(gctx, sum, z) : z;
     }
     // Final rvq oproj: 512 → 768
-    ggml_tensor * x = ggml_mul_mat(gctx, m_quant_oproj_w, sum);     // (768, T) f32
+    ggml_tensor * x = mm_(gctx, m_quant_oproj_w, sum);     // (768, T) f32
     x = ggml_add(gctx, x, to_f32_(gctx, m_quant_oproj_b));          // (768, T)
 
     // Transformer stages, each followed by a patch upsample.
@@ -1172,13 +1187,13 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
 
     // ── Quantizer: input_proj → 32-step residual LFQ encoding ─────────────
     // x: (768, T_audio).
-    ggml_tensor * residual = ggml_mul_mat(gctx, m_quant_iproj_w, x);          // (512, T)
+    ggml_tensor * residual = mm_(gctx, m_quant_iproj_w, x);          // (512, T)
     residual = ggml_add(gctx, residual, to_f32_(gctx, m_quant_iproj_b));      // (512, T)
 
     std::array<ggml_tensor *, CODEC_NUM_VQ> indices {};
     for (int i = 0; i < n_vq; ++i) {
         // z_e = q[i].iproj(residual)
-        ggml_tensor * z_e = ggml_mul_mat(gctx, m_q_iproj_w[i], residual);     // (8, T)
+        ggml_tensor * z_e = mm_(gctx, m_q_iproj_w[i], residual);     // (8, T)
         z_e = ggml_add(gctx, z_e, to_f32_(gctx, m_q_iproj_b[i]));             // (8, T)
 
         // L2-normalize per timestep (along the 8-dim, which is ne[0]).
@@ -1198,7 +1213,7 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
         // Residual update: residual -= q[i].oproj( codebook[i][idx] )
         // (raw codebook here, not the normalized version — matches LFQ.decode_code_wo_out_proj)
         ggml_tensor * z_q = ggml_get_rows(gctx, m_codebook[i], idx);          // (8, T) f32
-        z_q = ggml_mul_mat(gctx, m_q_oproj_w[i], z_q);                        // (512, T)
+        z_q = mm_(gctx, m_q_oproj_w[i], z_q);                        // (512, T)
         z_q = ggml_add(gctx, z_q, to_f32_(gctx, m_q_oproj_b[i]));             // (512, T)
         residual = ggml_sub(gctx, residual, z_q);                              // (512, T)
     }
