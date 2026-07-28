@@ -20,6 +20,14 @@ struct GenerateRequest {
     std::string text;
     // Channel-interleaved f32 at the model's sampling rate / channel count.
     std::optional<std::vector<float>> reference_wav;
+    // Transcript of `reference_wav`. Supplying it selects *continuation mode*:
+    // the reference goes in the assistant channel behind the generation slot
+    // with no closing audio_end, and the model continues speaking from it,
+    // rather than being conditioned on it as a user-channel exemplar. The grid's
+    // synthesis text becomes ref_text followed by `text` — the model has already
+    // "said" the reference, so it carries on into the new material.
+    // MOSS-TTS-Local only.
+    std::optional<std::string>        ref_text;
     std::optional<std::string>        instruction;     // e.g. voice description
     std::optional<std::string>        language;        // "en", "zh", ...
     std::optional<std::string>        quality;         // upstream "quality" hint
@@ -53,5 +61,18 @@ using StreamCallback = std::function<void(const float * pcm, int64_t n_samples)>
 GenerateResult generate(Model & model,
                         const GenerateRequest & req,
                         StreamCallback cb = {});
+
+// Test seam: build the prompt grid alone, with reference codes supplied
+// directly rather than encoded from audio. Prompt construction has no numerical
+// tolerance — an id is right or it is not — so diffing ids against the
+// reference processor is the cheapest correctness check available, and it needs
+// neither the codec nor the backbone.
+//   ref_codes: (n_vq, T_ref) row-major, or null
+//   returns:   (n_pos, 1 + n_vq) row-major
+std::vector<int32_t> debug_build_prompt_grid(Model & model,
+                                             const GenerateRequest & req,
+                                             const std::vector<int32_t> * ref_codes,
+                                             int32_t  T_ref,
+                                             int32_t & n_pos_out);
 
 } // namespace openmoss

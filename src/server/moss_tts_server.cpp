@@ -34,6 +34,12 @@
 //     "max_new_tokens":    int,       // default 4096
 //     "response_format":   str,       // "wav" (default) | "pcm"
 //     "reference_wav_b64": str,       // base64 of a WAV file for voice cloning
+//     "ref_text":          str,       // transcript of the reference. Selects
+//                                     //   continuation mode (moss_tts_local
+//                                     //   only): the reference goes in the
+//                                     //   assistant channel and the model
+//                                     //   carries on speaking from it.
+//     "references": [ {"ref_audio": str, "ref_text": str} ]   // same, array form
 //     "sampling": {
 //        "text_temperature": float, "text_top_p": float, "text_top_k": int,
 //        "audio_temperature": float, "audio_top_p": float, "audio_top_k": int,
@@ -293,20 +299,20 @@ int extract_token_prefix(std::string & text) {
     return n;
 }
 
-// Pull reference audio out of a request. Two shapes are accepted: the legacy
-// scalar `reference_wav_b64`, and the cookbooks' `references[]` array of
-// {ref_audio, ref_text}.
+// Pull reference audio (and optionally its transcript) out of a request. Two
+// shapes are accepted: the legacy scalar `reference_wav_b64`, and the cookbooks'
+// `references[]` array of {ref_audio, ref_text}.
 //
-// `ref_text` is deliberately *rejected* rather than ignored. Supplying the
-// reference's transcript selects a different prompt layout upstream —
-// continuation mode, where the reference audio goes in the assistant channel
-// behind slot 151656 with no closing audio_end — and the pipeline only builds
-// the user-channel layout today. Accepting the field and dropping it would look
-// like working voice cloning while quietly doing something else.
+// Supplying `ref_text` selects continuation mode: the reference goes in the
+// assistant channel behind the generation slot with no closing audio_end, and
+// the model carries on speaking from it. That layout is only implemented for
+// moss_tts_local; generate() rejects it for the delay family rather than
+// silently cloning by a different mechanism.
 //
 // Returns false and fills `err` on a malformed request. `out_b64` is left empty
 // when the request carries no reference at all.
-bool extract_reference(const json & body, std::string & out_b64, std::string & err) {
+bool extract_reference(const json & body, std::string & out_b64,
+                       std::string & out_text, std::string & err) {
     if (body.contains("references")) {
         const json & refs = body["references"];
         if (!refs.is_array()) { err = "'references' must be an array"; return false; }
@@ -317,22 +323,21 @@ bool extract_reference(const json & body, std::string & out_b64, std::string & e
         }
         const json & r = refs[0];
         if (!r.is_object()) { err = "each entry in 'references' must be an object"; return false; }
-        if (r.contains("ref_text") && r["ref_text"].is_string()
-                                   && !r["ref_text"].get<std::string>().empty()) {
-            err = "ref_text is not implemented: a reference transcript selects "
-                  "continuation mode, which this build does not construct. Omit "
-                  "ref_text to clone from audio alone.";
-            return false;
-        }
         if (!r.contains("ref_audio") || !r["ref_audio"].is_string()) {
             err = "'references[0].ref_audio' must be a base64 WAV string";
             return false;
         }
         out_b64 = r["ref_audio"].get<std::string>();
+        if (r.contains("ref_text") && r["ref_text"].is_string()) {
+            out_text = r["ref_text"].get<std::string>();
+        }
         return true;
     }
     if (body.contains("reference_wav_b64") && body["reference_wav_b64"].is_string()) {
         out_b64 = body["reference_wav_b64"].get<std::string>();
+    }
+    if (body.contains("ref_text") && body["ref_text"].is_string()) {
+        out_text = body["ref_text"].get<std::string>();
     }
     return true;
 }
@@ -611,10 +616,16 @@ int main(int argc, char ** argv) {
         finalize_voicegen_request(req, model->dims());
 
         {
-            std::string ref_b64, ref_err;
-            if (!extract_reference(body, ref_b64, ref_err)) {
+            std::string ref_b64, ref_text, ref_err;
+            if (!extract_reference(body, ref_b64, ref_text, ref_err)) {
                 return send_text_error(rs, 400, ref_err);
             }
+            if (!ref_text.empty() && ref_b64.empty()) {
+                return send_text_error(rs, 400,
+                    "ref_text was supplied without reference audio; continuation "
+                    "mode needs both");
+            }
+            if (!ref_text.empty()) req.ref_text = ref_text;
             if (!ref_b64.empty()) {
                 try {
                     auto wav_bytes = b64_decode(ref_b64);
@@ -728,10 +739,16 @@ int main(int argc, char ** argv) {
 
         // Voice cloning: a base64 WAV reference the model continues in.
         {
-            std::string ref_b64, ref_err;
-            if (!extract_reference(body, ref_b64, ref_err)) {
+            std::string ref_b64, ref_text, ref_err;
+            if (!extract_reference(body, ref_b64, ref_text, ref_err)) {
                 return send_text_error(rs, 400, ref_err);
             }
+            if (!ref_text.empty() && ref_b64.empty()) {
+                return send_text_error(rs, 400,
+                    "ref_text was supplied without reference audio; continuation "
+                    "mode needs both");
+            }
+            if (!ref_text.empty()) req.ref_text = ref_text;
             if (!ref_b64.empty()) {
                 try {
                     auto wav_bytes = b64_decode(ref_b64);

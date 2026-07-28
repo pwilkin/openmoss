@@ -3,8 +3,8 @@
 // End-to-end pipeline glue.
 //
 // What's wired up here:
-//   - A prompt builder that mirrors the Python reference (without the audio
-//     reference / continuation paths — those will land with task #6).
+//   - A prompt builder that mirrors the Python reference, including the
+//     voice-clone reference path and (MOSS-TTS-Local only) continuation mode.
 //   - The autoregressive generation loop:
 //       1) build prompt grid (S, 1+n_vq) of int32
 //       2) compute summed input embeddings (S, hidden) on the aux GGML backend
@@ -13,17 +13,16 @@
 //          run audio LM heads, run DelayState, embed the next row, decode
 //       5) once DelayState reports stopping, extract audio codes
 //
-// What's NOT wired up:
-//   - Reference audio encoding (codec encoder is a future task)
-//   - Codec decoding to a waveform (future task — for now we return an empty
-//     waveform but expose `n_audio_frames` so callers can see the codes were
-//     produced)
+// Not wired up: continuation mode for the delay family. Its slot layout differs
+// and it has no verified reference here, so GenerateRequest::ref_text is
+// rejected for that architecture rather than silently ignored.
 
 #include "openmoss/pipeline.h"
 #include "openmoss/codec.h"
 #include "openmoss/frame_decoder.h"
 #include "openmoss/tokenizer.h"
 
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -229,7 +228,12 @@ std::vector<int32_t> build_prompt_grid_local(const Tokenizer & tok,
     append_text_rows(grid, cols, pad, enc("user\n"));
     append_text_rows(grid, cols, pad, enc("<user_inst>\n- Reference(s):\n"));
 
-    if (ref_codes && T_ref > 0) {
+    // Continuation mode puts nothing here — it takes the same "None" the
+    // no-reference path takes, and the reference audio goes after the trailing
+    // audio_start instead. See the tail of this function.
+    const bool continuation = req.ref_text.has_value() && ref_codes && T_ref > 0;
+
+    if (ref_codes && T_ref > 0 && !continuation) {
         append_text_rows(grid, cols, pad, { d.audio_start_token_id });
         for (int32_t t = 0; t < T_ref; ++t) {
             grid.push_back(d.audio_user_slot_token_id);
@@ -257,7 +261,26 @@ std::vector<int32_t> build_prompt_grid_local(const Tokenizer & tok,
     }
 
     // The synthesis text is its own segment — see (2) above.
-    append_text_rows(grid, cols, pad, enc(req.text));
+    //
+    // In continuation mode the model has already "said" the reference audio, so
+    // the text it is working from is the reference's transcript followed by the
+    // new material. Upstream takes a single combined string; a space is inserted
+    // only when neither side already provides a boundary, since scripts without
+    // word spacing must not gain one.
+    {
+        std::string text = req.text;
+        if (continuation) {
+            const std::string & rt = *req.ref_text;
+            std::string joined = rt;
+            const bool have_boundary =
+                (!rt.empty()  && std::isspace(static_cast<unsigned char>(rt.back()))) ||
+                (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())));
+            if (!rt.empty() && !text.empty() && !have_boundary) joined += ' ';
+            joined += text;
+            text = joined;
+        }
+        append_text_rows(grid, cols, pad, enc(text));
+    }
 
     // \n</user_inst><|im_end|>\n<|im_start|>assistant\n<|audio_start|>
     append_text_rows(grid, cols, pad, enc("\n</user_inst>"));
@@ -266,6 +289,18 @@ std::vector<int32_t> build_prompt_grid_local(const Tokenizer & tok,
     append_text_rows(grid, cols, pad, { d.im_start_token_id });
     append_text_rows(grid, cols, pad, enc("assistant\n"));
     append_text_rows(grid, cols, pad, { d.audio_start_token_id });
+
+    // Continuation mode: the reference codes sit here, in the *assistant*
+    // channel, and there is deliberately no audio_end — generation picks up
+    // straight from the last reference frame.
+    if (continuation) {
+        for (int32_t t = 0; t < T_ref; ++t) {
+            grid.push_back(d.audio_assistant_gen_slot_token_id);
+            for (int32_t i = 0; i < d.n_vq; ++i) {
+                grid.push_back((*ref_codes)[size_t(i) * size_t(T_ref) + size_t(t)]);
+            }
+        }
+    }
 
     n_pos_out = int32_t(grid.size() / size_t(cols));
     return grid;
@@ -298,6 +333,27 @@ void llama_decode_embeddings(llama_context * ctx,
 }
 
 } // namespace
+
+std::vector<int32_t> debug_build_prompt_grid(Model & model,
+                                             const GenerateRequest & req,
+                                             const std::vector<int32_t> * ref_codes,
+                                             int32_t  T_ref,
+                                             int32_t & n_pos_out) {
+    const auto & d = model.dims();
+    Tokenizer * tok = model.tokenizer();
+    switch (d.arch) {
+        case Arch::TTSLocal:
+            return build_prompt_grid_local(*tok, d, req, ref_codes, T_ref, n_pos_out);
+        case Arch::TTSDelay: {
+            std::string block;
+            if (ref_codes && T_ref > 0) block = build_reference_audio_block(*tok, d, T_ref);
+            return build_prompt_grid(*tok, d, req, block, ref_codes, T_ref, n_pos_out);
+        }
+        case Arch::SoundEffect:
+            break;
+    }
+    throw std::runtime_error("debug_build_prompt_grid: this architecture has no prompt grid");
+}
 
 GenerateResult generate(Model & model,
                         const GenerateRequest & req,
@@ -345,6 +401,14 @@ GenerateResult generate(Model & model,
     std::vector<int32_t> grid;
     switch (d.arch) {
         case Arch::TTSDelay:
+            if (req.ref_text) {
+                // The delay family's continuation layout differs and is
+                // unverified here; failing beats silently ignoring the field
+                // and cloning by a different mechanism than the caller asked for.
+                throw std::runtime_error(
+                    "generate(): ref_text (continuation mode) is only implemented "
+                    "for moss_tts_local");
+            }
             grid = build_prompt_grid(*tok, d, req, reference_block,
                                      T_ref > 0 ? &ref_codes : nullptr, T_ref,
                                      prompt_len);
