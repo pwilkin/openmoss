@@ -1,27 +1,78 @@
 # openmoss-ggml
 
-A standalone C++/[GGML](https://www.github.com/ggml-org/ggml) port of [MOSS-TTS-Delay](https://huggingface.co/OpenMOSS-Team/MOSS-TTS) — a
-Qwen3-8B language backbone + 32 RVQ audio codebooks + a 1.6 B pure-transformer audio codec, all
-runnable from one self-contained binary. The Qwen3 backbone is hosted by **libllama** (so you get
-all of llama.cpp's quantizations and CUDA / CPU / Vulkan backends for free); the embedding stack,
-LM heads, and the codec encoder/decoder are GGML graphs we build ourselves.
+A standalone C++/[GGML](https://www.github.com/ggml-org/ggml) runtime for the **MOSS audio
+models** — speech and sound effects — from one self-contained binary. The Qwen3 backbone is
+hosted by **libllama** (so you get all of llama.cpp's quantizations and CUDA / CPU / Vulkan /
+ROCm backends for free); the embedding stack, LM heads, codec, DiT and VAE are GGML graphs we
+build ourselves.
+
+Three model families are supported, and one binary handles all of them — the architecture is
+recorded in the GGUF and dispatched on at run time:
+
+| Family | Arch id | Shape | Output |
+|---|---|---|---|
+| [MOSS-TTS](https://huggingface.co/OpenMOSS-Team/MOSS-TTS) / v1.5 / VoiceGenerator | `moss_tts_delay` | Qwen3-8B, 32 RVQ codebooks on a delay pattern, MOSS-Audio-Tokenizer v1 | 24 kHz mono |
+| MOSS-TTS-Local-Transformer-v1.5 | `moss_tts_local` | Qwen3-4B, 12 codebooks emitted per frame by a 1-layer depth transformer, MOSS-Audio-Tokenizer v2 | 48 kHz **stereo** |
+| MOSS-SoundEffect-v2.0 | `moss_soundeffect` | **not autoregressive** — a 30-block Wan-style DiT sampled by flow matching, Qwen3-1.7B text encoder, continuous DAC VAE | 48 kHz mono |
+
+Everything is verified seam-by-seam against the PyTorch reference rather than by ear; see
+[`docs/STATUS.md`](docs/STATUS.md) for the method and the numbers.
 
 Two entry points:
 
 - **`moss-tts-cli`** — one-shot synthesis. Loads the model, synthesizes one utterance, writes a
   WAV, exits.
 - **`moss-tts-server`** — keeps the model resident and exposes an HTTP API for repeated
-  generations (TTS and voice cloning). Also serves a small browser **WebUI** with a per-browser
-  history of generated audio (IndexedDB). See [WebUI](#webui).
+  generations (TTS, sound effects, voice cloning), with optional **streaming**. Also serves a
+  small browser **WebUI** with a per-browser history of generated audio (IndexedDB). See
+  [WebUI](#webui).
 
 On a single 16 GB GPU (RTX 5060 Ti) the Q8\_0 backbone produces ~10 s of speech in ~4 s of
-wall-clock; the codec runs at ~50× real-time. See `docs/STATUS.md` for a detailed feature matrix,
-pipeline diagram, and benchmark numbers.
+wall-clock; the codec runs at ~50× real-time. See [`docs/STATUS.md`](docs/STATUS.md) for a
+detailed feature matrix, pipeline diagram, and benchmark numbers.
 
 Prebuilt binaries for Linux and Windows (Vulkan, ROCm, CUDA) are published on the
 [releases page](../../releases) — each archive bundles the llama.cpp libraries it was built
 against, so no separate llama.cpp build is needed. Serves as the `openmoss` backend of
 [Lemonade](https://github.com/lemonade-sdk/lemonade).
+
+## What's new in 0.2.0
+
+Two entire model families and streaming, on top of what 0.1.x shipped for MOSS-TTS-Delay.
+
+**New model families**
+
+- **MOSS-TTS-Local-Transformer-v1.5** (`moss_tts_local`) — 48 kHz stereo. A 1-layer depth
+  transformer emits all 12 codebooks per frame instead of the delay pattern, backed by
+  MOSS-Audio-Tokenizer v2 (6 stages per side, per-stage sliding windows). Validated exactly
+  against the reference.
+- **MOSS-SoundEffect-v2.0** (`moss_soundeffect`) — text → sound effects. A Wan-style DiT sampled
+  by flow matching through a continuous DAC VAE, verified seam by seam. Published GGUFs:
+  [`ilintar/moss-soundeffect-gguf`](https://huggingface.co/ilintar/moss-soundeffect-gguf).
+
+**Streaming** — audio is emitted as it is generated rather than after the whole utterance. The
+codec decoder keeps a per-stage K/V cache, so nothing is recomputed. `--stream` on the CLI
+(`--stream-out -` pipes raw PCM to a player), `"stream": true` on the server. Cuts time to first
+audio from 2.54 s to 0.57 s on a 4.8 s utterance. See [`docs/STREAMING.md`](docs/STREAMING.md).
+
+**Also new**
+
+- **Voice cloning** through the codec *encoder*, and **continuation mode** (`ref_text`) for
+  MOSS-TTS-Local, where the model carries on speaking from the reference instead of imitating it.
+- **Server**: `/sfx`, `pcm` responses, `/v1/models`, `/v1/audio/voices`, and full option parity
+  between the native and OpenAI-compatible routes.
+- **WebUI**: a MOSS-SoundEffect mode.
+- **Q8\_0 sidecar quantization** for the projection matrices (`--sidecar-dtype q8_0`).
+- `--min-audio-frames` / `--max-audio-frames` to bound a segment when a model will not stop.
+
+**Fixes worth knowing about**
+
+- **A long `reference_wav_b64` could kill the server.** libllama aborts the process when a batch
+  exceeds `n_batch`, and the whole prompt was submitted as one; a voice-clone reference costs one
+  token per codec frame, so ~5.5 minutes of it was enough. The prefill is now chunked.
+- **The codec accumulated its matmuls in f16** on Vulkan, costing ~1e-2 relative on the decoded
+  waveform — 16× worse than f32 accumulation. Now forced to f32 (`--vk-f32` covers the backbone).
+- The tree did not build under **clang** at all, which also blocked `-DGGML_HIP=ON`.
 
 ## Quick start
 
@@ -94,7 +145,10 @@ add `build\bin\Release` to `PATH`).
 Linux:
 - `build/moss-tts-cli`
 - `build/moss-tts-server`
-- `build/moss-tts-info`, `build/moss-tts-compute-test`, `build/moss-codec-roundtrip` (diagnostics)
+- diagnostics — `moss-tts-info`, `moss-tts-compute-test`, `moss-prompt-probe`,
+  `moss-local-probe`, `moss-codec-roundtrip`, `moss-codec-causality`, `moss-codec-stream`,
+  `moss-sfx-probe`, `moss-sfx-vae-probe`. Each checks one seam against the PyTorch reference;
+  [`docs/STATUS.md`](docs/STATUS.md) says what each one proves.
 - `build/bin/libllama.so`, `build/bin/libggml*.so`
 
 Windows (MSVC):
@@ -103,33 +157,60 @@ Windows (MSVC):
 
 ## Convert weights
 
-**Pre-built GGUFs:** [`ilintar/moss-tts-gguf`](https://huggingface.co/ilintar/moss-tts-gguf) —
-`moss-tts-1.5-q8_0.gguf` (recommended) and `moss-tts-1.5.gguf` (f16), each with its
-`*.extras.gguf` sidecar. Download both files for a variant and pass the backbone to `--model`
-(the sidecar is auto-located alongside it). Or convert your own:
+**Pre-built GGUFs**, one repo per family — download the backbone *and* its `*.extras.gguf`
+sidecar, then pass the backbone to `--model` (the sidecar is auto-located alongside it):
 
-The converter produces **two** GGUF files alongside each other:
+| Family | Repo |
+|---|---|
+| `moss_tts_delay` | [`ilintar/moss-tts-gguf`](https://huggingface.co/ilintar/moss-tts-gguf) |
+| `moss_tts_local` | [`ilintar/moss-tts-local-gguf`](https://huggingface.co/ilintar/moss-tts-local-gguf) |
+| `moss_soundeffect` | [`ilintar/moss-soundeffect-gguf`](https://huggingface.co/ilintar/moss-soundeffect-gguf) |
 
-- `moss-tts.gguf` — the Qwen3-8B backbone, pure Qwen3 layout that libllama can load directly.
-- `moss-tts.extras.gguf` — the sidecar: 32 audio embedding tables, 33 LM heads, codec encoder /
-  RVQ codebooks / codec decoder, and the `moss.*` KV namespace (frame rate, special token ids,
-  …). Loaded by us, not libllama.
+Or convert your own. The converter produces **two** GGUF files alongside each other:
+
+- `moss-tts.gguf` — the Qwen3 backbone, pure Qwen3 layout that libllama can load directly.
+- `moss-tts.extras.gguf` — the sidecar: the audio embedding tables and LM heads (32 + 33 for the
+  delay family, 12 for MOSS-TTS-Local), the codec encoder / RVQ codebooks / decoder, and the
+  `moss.*` KV namespace (architecture, frame rate, special token ids, …). Loaded by us, not
+  libllama. For MOSS-SoundEffect the sidecar instead carries the DiT, the DAC VAE and the
+  scheduler constants — there is no codec.
+
+The family is detected from the model's `config.json`; `--arch` overrides it.
 
 ```bash
 pip install safetensors numpy huggingface_hub gguf
 
+# MOSS-TTS (delay family)
 python scripts/convert_hf_to_gguf.py \
     --moss-tts OpenMOSS-Team/MOSS-TTS \
     --codec    OpenMOSS-Team/MOSS-Audio-Tokenizer \
-    --output   weights/moss-tts.gguf \
-    --backbone-dtype f16
+    --output   weights/moss-tts.gguf
+
+# MOSS-TTS-Local — 48 kHz stereo, codec v2
+python scripts/convert_hf_to_gguf.py \
+    --moss-tts OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+    --codec    OpenMOSS-Team/MOSS-Audio-Tokenizer-v2 \
+    --output   weights/moss-tts-local.gguf
+
+# MOSS-SoundEffect — no codec; the DiT and VAE come from the same repo
+python scripts/convert_hf_to_gguf.py \
+    --moss-tts OpenMOSS-Team/MOSS-SoundEffect-v2.0 \
+    --output   weights/moss-soundeffect.gguf
 ```
 
-Useful flags: `--llama-cpp-dir` to point at a different llama.cpp source tree (the converter
-shells out to llama.cpp's own `convert_hf_to_gguf.py`; by default it uses the bundled
-`third_party/llama.cpp` submodule — no llama.cpp *build* is required), `--cache-dir` for the
-HF cache, `--scratch-dir`/`--keep-scratch` for inspecting the intermediate extracted backbone,
-`--skip-extract` to reuse a previously-extracted backbone if you already ran a conversion.
+| flag | meaning |
+|---|---|
+| `--arch ID` | force the family instead of detecting it from `config.json` |
+| `--backbone-dtype f16\|f32\|bf16` | backbone precision (default f16) |
+| `--sidecar-dtype f16\|q8_0` | quantize the sidecar's projection matrices (default f16) |
+| `--sidecar-only` | rewrite just the sidecar, reusing an existing backbone |
+| `--llama-cpp-dir DIR` | a different llama.cpp source tree; defaults to the bundled submodule (no llama.cpp *build* required) |
+| `--cache-dir` / `--scratch-dir` / `--keep-scratch` / `--skip-extract` | HF cache location, and reusing or inspecting the intermediate extracted backbone |
+
+**Do not quantize the MOSS-SoundEffect backbone.** It is a text *encoder* whose hidden states are
+consumed as a continuous conditioning vector, so there is no sampling stage to absorb the error:
+Q8\_0 moves the conditioning to 2.7e-2 and the final latent to 1.8e-1. f16 against the source
+bf16 is not a compromise — the measured round-trip across 2.03 B weights is 4.7e-9.
 
 ### Quantization
 
@@ -159,7 +240,7 @@ Common options:
 | flag                  | meaning                                                            |
 |-----------------------|--------------------------------------------------------------------|
 | `--text "…"`          | utterance to synthesize (required)                                 |
-| `--output PATH`       | output WAV (default `out.wav`, 16-bit mono @ 24 kHz)               |
+| `--output PATH`       | output WAV (default `out.wav`, 16-bit; rate and channels come from the model — see below) |
 | `--reference PATH`    | reference WAV for voice cloning — speaker is encoded and prepended |
 | `--instruction "…"`   | voice / style description (voice-generation mode, no reference)    |
 | `--language CODE`     | language hint (`en` / `zh` / …)                                     |
@@ -175,6 +256,16 @@ Common options:
 | `--stream [N]`        | decode incrementally, N frames per chunk (default 8; a frame is 80 ms) |
 | `--stream-out PATH`   | also write each chunk as raw s16le as it arrives; `-` is stdout    |
 
+Sample rate and channel count are properties of the loaded model, never hardcoded — they
+come from `ModelDims::sampling_rate` / `n_channels`, which the converter writes into the
+GGUF:
+
+| family             | rate   | channels | codebooks (`n_vq`) |
+|--------------------|--------|----------|--------------------|
+| `moss_tts_delay`   | 24 kHz | mono     | 32                 |
+| `moss_tts_local`   | 48 kHz | stereo   | 12                 |
+| `moss_soundeffect` | 48 kHz | mono     | — (not an RVQ model) |
+
 ### Plain TTS
 
 ```bash
@@ -187,9 +278,10 @@ Common options:
 
 ### Voice cloning
 
-Pass a reference WAV with `--reference`. The codec encoder converts it to 32-codebook codes which
-get spliced into the user-side audio block of the chat prompt, and the model continues in that
-voice.
+Pass a reference WAV with `--reference`. The codec encoder converts it to codes which get
+spliced into the user-side audio block of the chat prompt, and the model continues in that
+voice. The codebook count is the model's `n_vq` — 32 for the delay family, 12 for
+MOSS-TTS-Local.
 
 ```bash
 ./build/moss-tts-cli \
@@ -200,8 +292,9 @@ voice.
     --output    cloned.wav
 ```
 
-Any sample rate works — the WAV is linearly resampled to 24 kHz internally. A few seconds of
-clean speech is usually enough.
+Any WAV works — it is linearly resampled to the model's rate internally, and its channel count
+is adapted to match (a mono file is duplicated for the stereo codec, a stereo one downmixed for
+the mono codec). A few seconds of clean speech is usually enough.
 
 ### Streaming
 
@@ -247,27 +340,44 @@ The CMake build stages the source tree's `webui/` next to the server binary, so 
 ### Endpoints
 
 - `GET /health` — readiness probe, returns `ok`.
-- `GET /info` — JSON with model dims, codec status, and the request counter.
-- `POST /tts` — JSON in, `audio/wav` out (or `text/plain` with the error message on failure).
-- `POST /v1/audio/speech` — OpenAI-compatible TTS endpoint.
+- `GET /info` — JSON with model dims, codec status, and the request counter. For
+  MOSS-SoundEffect it also reports `max_seconds` and the solver defaults.
+- `GET /v1/models` — OpenAI-compatible model list. Always exactly one entry, named after
+  the loaded architecture; the model cannot be switched at runtime.
+- `GET /v1/audio/voices` — voices registry, vLLM-Omni shaped. Reports the single `default`
+  entry, or an empty list for MOSS-SoundEffect, which has no notion of a voice. Cloning is
+  driven by reference audio rather than a named voice.
+- `POST /tts` — native TTS for the autoregressive families. JSON in, `audio/wav` or
+  `audio/pcm` out per `response_format` (or `text/plain` with the error message on failure).
+- `POST /sfx` — native MOSS-SoundEffect. Same response formats.
+- `POST /v1/audio/speech` — OpenAI-compatible; dispatches on the loaded architecture.
+
+One model is loaded at startup, so exactly one of `/tts` and `/sfx` applies — the other
+answers `400` with a pointer to the right one.
 
 #### `POST /tts` request body
 
 | field                 | type     | required | notes                                                    |
 |-----------------------|----------|----------|----------------------------------------------------------|
-| `text`                | string   | yes      | utterance to synthesize                                  |
+| `text`                | string   | yes      | utterance to synthesize. May start with a `${token:N}` prefix as an inline duration hint |
 | `instruction`         | string   | no       | voice / style description (voice-generation mode)        |
 | `language`            | string   | no       | language hint                                            |
-| `tokens`              | int      | no       | approximate length (1 s ≈ 12.5 tokens)                   |
+| `quality`             | string   | no       | upstream quality hint, passed through into the prompt    |
+| `token_count`         | int      | no       | duration hint, 1 s ≈ 12.5 tokens. Wins over the `${token:N}` prefix |
+| `tokens`              | int      | no       | legacy alias for `token_count`                           |
 | `max_new_tokens`      | int      | no       | default 4096                                             |
 | `reference_wav_b64`   | string   | no       | base64-encoded WAV bytes for voice cloning               |
+| `ref_text`            | string   | no       | transcript of the reference — selects continuation mode (`moss_tts_local` only); needs `reference_wav_b64` alongside it |
+| `references`          | array    | no       | array form of the two above: `[{"ref_audio": …, "ref_text": …}]`. At most one entry |
 | `response_format`     | string   | no       | `"wav"` (default) or `"pcm"` — raw 16-bit little-endian, no container |
 | `stream`              | bool     | no       | default false; chunked transfer, requires `"pcm"` (see below) |
 | `stream_chunk_frames` | int      | no       | default 8; one frame is 80 ms of audio                   |
 | `sampling`            | object   | no       | `text_temperature`, `text_top_p`, `text_top_k`, `audio_temperature`, `audio_top_p`, `audio_top_k`, `audio_repetition_penalty`, `seed` |
 
 Response headers carry timing info: `X-MOSS-Audio-Frames`, `X-MOSS-Generate-Seconds`,
-`X-MOSS-Decode-Seconds`.
+`X-MOSS-Decode-Seconds`, and `X-MOSS-Channels`. A streamed response carries
+`X-MOSS-Sample-Rate`, `X-MOSS-Channels`, and `X-MOSS-Stream-Chunk-Frames` instead — the
+timings are not known when the headers go out.
 
 #### Streaming
 
@@ -288,27 +398,67 @@ the last solver step.
 
 The payload limit is 64 MB, which fits a ~60 s reference WAV after base64 encoding.
 
+#### `POST /sfx` request body
+
+MOSS-SoundEffect only — a diffusion transformer rather than an autoregressive model, so
+none of the TTS sampling knobs apply.
+
+| field                    | type   | required | notes                                                  |
+|--------------------------|--------|----------|--------------------------------------------------------|
+| `prompt`                 | string | yes      | sound description (`input` and `text` are also accepted) |
+| `seconds`                | float  | no       | default 10.0, capped by the model. Must be > 0         |
+| `steps`                  | int    | no       | default 100; each costs two DiT passes. Must be ≥ 1    |
+| `cfg_scale`              | float  | no       | default 4.0; 1.0 skips the unconditional pass and halves the work |
+| `sigma_shift`            | float  | no       | default 5.0                                            |
+| `negative_prompt`        | string | no       | default empty, which is what it was trained on         |
+| `seed`                   | uint64 | no       | default 0 — a valid seed, not a sentinel               |
+| `append_duration_suffix` | bool   | no       | default true; appends ` duration: <X>s` to the prompt, as trained |
+| `response_format`        | string | no       | `"wav"` (default) or `"pcm"`                           |
+
+`seconds` is purely textual: the DiT always denoises `max_seconds` worth of latent and the
+waveform is cropped afterwards. `stream` is rejected outright — flow matching refines every
+latent frame at once, so no prefix exists until the last solver step.
+
+Response headers: `X-MOSS-Prompt` (the prompt as actually sent, duration suffix included),
+`X-MOSS-Latent-Frames`, `X-MOSS-Solve-Seconds`, `X-MOSS-Decode-Seconds`.
+
+```bash
+curl -s -X POST http://localhost:8080/sfx \
+    -H 'Content-Type: application/json' \
+    -d '{"prompt":"a distant thunderclap rolling over a field","seconds":8}' \
+    -o sfx.wav
+```
+
 #### `POST /v1/audio/speech` — OpenAI-compatible endpoint
 
-Accepts the same JSON schema as the OpenAI TTS API.
-This allows drop-in compatibility with any client or SDK that targets the OpenAI API.
+Accepts the OpenAI TTS JSON schema, so any client or SDK targeting the OpenAI API works
+drop-in, plus a few native extensions for what that schema has no field for.
 
-| field              | type   | required | notes                                                       |
-|--------------------|--------|----------|-------------------------------------------------------------|
-| `input`            | string | yes      | text to synthesize (maps to native `text`)                  |
-| `model`            | string | no       | ignored (the model is already loaded at server startup)     |
-| `voice`            | string | no       | passed as an instruction hint to the model                  |
-| `response_format`  | string | no       | `"wav"` (default) or `"pcm"`; anything else is a 400        |
-| `stream`           | bool   | no       | default false; same semantics as `/tts`                     |
-| `speed`            | float  | no       | 0.25–4.0, scales the token budget (default 1.0)             |
+| field                | type   | required | notes                                                     |
+|----------------------|--------|----------|-----------------------------------------------------------|
+| `input`              | string | yes      | text to synthesize (maps to native `text`), or the sound description for MOSS-SoundEffect |
+| `model`              | string | no       | ignored (the model is already loaded at server startup)     |
+| `voice`              | string | no       | passed as an instruction hint to the model                  |
+| `response_format`    | string | no       | `"wav"` (default) or `"pcm"`; anything else is a 400        |
+| `stream`             | bool   | no       | default false; same semantics as `/tts`                     |
+| `stream_chunk_frames`| int    | no       | default 8; one frame is 80 ms of audio                      |
+| `speed`              | float  | no       | 0.25–4.0, scales the token budget (default 1.0). This sets `max_new_tokens`; the field itself is not read here |
+| `token_count`        | int    | no       | duration hint, as on `/tts`; the `${token:N}` prefix works too |
+| `reference_wav_b64` / `ref_text` / `references` | — | no | voice cloning and continuation, exactly as on `/tts`        |
+| `sampling`           | object | no       | as on `/tts`. The same keys are also accepted flattened at the top level, which is what the cookbooks send — flat keys win over the nested form |
+
+When the loaded model is MOSS-SoundEffect this route dispatches to the `/sfx` path instead:
+`input` becomes the prompt, the [`/sfx`](#post-sfx-request-body) solver fields are accepted
+as extensions, and `voice` and `speed` are ignored.
 
 Validation errors (missing/non-string `input`, undecodable or non-WAV `reference_wav_b64`,
 out-of-range `speed`, unsupported `response_format`, `stream` with `wav`) return `400`
 with a `text/plain` message.
 
-Response: `audio/wav` (16-bit PCM), same as the native endpoint. Rate and channel count
-come from the loaded model — 24 kHz mono for the delay family, 48 kHz stereo for
-MOSS-TTS-Local, 48 kHz mono for MOSS-SoundEffect — never hardcoded.
+Response: `audio/wav` or `audio/pcm` per `response_format`, 16-bit either way, same as the
+native endpoint. Rate and channel count come from the loaded model — 24 kHz mono for the
+delay family, 48 kHz stereo for MOSS-TTS-Local, 48 kHz mono for MOSS-SoundEffect — never
+hardcoded.
 
 ### Examples
 
@@ -416,6 +566,11 @@ fits.
 
 ## Architecture
 
+The **delay family** (`moss_tts_delay`), which is the most involved of the three on the LM side.
+MOSS-TTS-Local replaces the delay-pattern state machine with a depth transformer that emits all
+12 codebooks per frame, and MOSS-SoundEffect is not autoregressive at all — see
+[`docs/STATUS.md`](docs/STATUS.md) for those.
+
 ```
                   ┌────────────────────────────────────────────┐
    text  ────►    │ BPE tokenizer (Qwen3, 155 648 vocab)       │
@@ -462,16 +617,20 @@ see [`docs/STATUS.md`](docs/STATUS.md).
 |---------------------------------------|------------------------------------------------------------|
 | `scripts/convert_hf_to_gguf.py`       | HF → backbone GGUF + sidecar GGUF                          |
 | `src/model.cpp`, `src/aux_internal.h` | Two-file loader, aux backend, embed / LM-head graphs       |
-| `src/codec.cpp`                       | RLFQ + 4-stage transformer encoder/decoder graphs          |
+| `src/codec.cpp`                       | RLFQ + transformer encoder/decoder graphs (4 stages per side in v1, 6 in v2), batch and incremental |
 | `src/tokenizer.cpp`                   | libllama BPE wrapper                                       |
+| `src/frame_decoder.cpp`               | Family-agnostic seam between the backbone loop and the code sampler |
 | `src/delay.cpp`                       | DelayState + sampling (top-k/p, repetition penalty)        |
+| `src/local_transformer.cpp`           | MOSS-TTS-Local's depth transformer + its per-frame KV cache |
+| `src/dit.cpp`, `src/dac_vae.cpp`, `src/soundeffect.cpp` | MOSS-SoundEffect: the Wan-style DiT, the DAC VAE decoder, and the flow-matching sampler |
 | `src/pipeline.cpp`                    | Prompt builder + autoregressive loop + codec dispatch      |
 | `src/wav.cpp`                         | RIFF/WAVE I/O (no libsndfile dep)                          |
 | `src/cli/moss_tts_cli.cpp`            | CLI entry point                                            |
 | `src/server/moss_tts_server.cpp`      | HTTP server + static WebUI mount                           |
 | `webui/`                              | Browser WebUI (vanilla HTML / CSS / JS, IndexedDB history) |
 | `scripts/launch-webui.{sh,bat}`       | Server + WebUI launcher                                    |
-| `tests/`                              | Diagnostics: model info, compute-graph smoke, codec round-trip |
+| `tests/`                              | Seam probes — see [`docs/STATUS.md`](docs/STATUS.md) for what each proves |
+| `docs/STATUS.md`, `docs/STREAMING.md` | Feature matrix + how correctness is established; streaming design and measurements |
 | `third_party/cpp-httplib/httplib.h`   | Vendored single-header HTTP library                        |
 
 ## License

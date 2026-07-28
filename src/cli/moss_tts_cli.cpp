@@ -64,6 +64,7 @@ struct Args {
         "\n"
         "Required:\n"
         "  --model PATH           GGUF file produced by scripts/convert_hf_to_gguf.py\n"
+        "  --version              Print the openmoss version and exit\n"
         "  --text  STRING         Text to synthesize\n"
         "\n"
         "Optional:\n"
@@ -220,6 +221,7 @@ int main(int argc, char ** argv) {
         else if (k == "--init-latent")     a.init_latent = require_str(i, argc, argv);
         else if (k == "--dump-context")    a.dump_context = require_str(i, argc, argv);
         else if (k == "--vk-f32")          a.vk_f32 = true;
+        else if (k == "--version") { std::printf("openmoss %s\n", OPENMOSS_VERSION); return 0; }
         else if (k == "--help" || k == "-h") usage(0);
         else { std::fprintf(stderr, "unknown arg: %s\n", k.c_str()); usage(2); }
     }

@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
-project(openmoss CXX C)
+project(openmoss VERSION 0.2.0 LANGUAGES CXX C)
+
+# Surfaced by --version and GET /info so a bug report names a build, not "latest".
+add_compile_definitions(OPENMOSS_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

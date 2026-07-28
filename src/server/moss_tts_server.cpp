@@ -452,6 +452,7 @@ int main(int argc, char ** argv) {
     svr.Get("/info", [&](const httplib::Request &, httplib::Response & rs) {
         const auto & d = model->dims();
         json info = {
+            {"version",           OPENMOSS_VERSION},
             {"architecture",      openmoss::arch_name(d.arch)},
             {"sampling_rate",     d.sampling_rate},
             {"n_channels",        d.n_channels},
