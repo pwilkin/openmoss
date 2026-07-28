@@ -1,195 +1,90 @@
 # Implementation status
 
-| #  | Task                                                  | Status               | Notes |
-|----|-------------------------------------------------------|----------------------|-------|
-| 1  | Investigate codec architecture                        | done                 | 1.6B pure-transformer, 4 stages × downsample 240/2/2/2, RLFQ 32×1024 |
-| 2  | Project scaffolding (CMake, dirs, headers, stubs)     | done                 | builds clean against the vendored `third_party/llama.cpp` submodule |
-| 3  | GGUF converter (HF → backbone GGUF + sidecar GGUF)    | **done & validated** | produces `moss-tts.gguf` (15.32 GB) + `moss-tts.extras.gguf` (4.0 GB) |
-| 4  | Core C++ inference (LM side)                          | **done & validated** | backbone via libllama, audio embeds + LM heads as GGML, delay sampling, audio code extraction |
-| 5  | Codec decoder in GGML                                 | **done & validated** | 68 transformer layers + RLFQ + 4 patched upsamples, end-to-end on CUDA |
-| 6  | Voice cloning (codec encoder)                         | **done & validated** | encoder mirrors decoder; round-trip envelope correlation 1.000 against the original WAV |
-| 7  | CLI binary                                            | **done**             | runs end-to-end on real weights and writes a 24 kHz mono WAV |
-| 8  | Server binary                                         | **done**             | cpp-httplib v0.18.7 vendored; `GET /health`, `GET /info`, `POST /tts` (JSON in, audio/wav out, optional `reference_wav_b64` for cloning), `POST /v1/audio/speech` (OpenAI-compatible), static WebUI at `/` |
-| 9  | Quantization validation                               | **done**             | `llama-quantize --token-embedding-type f16 ... Q8_0` → ~8.7 GB; Q4\_K\_M → ~4.7 GB |
+openmoss is a standalone C++/GGML runtime for the MOSS audio models — CUDA,
+Vulkan and CPU, with the Qwen3 backbone driven through libllama and everything
+else written as GGML graphs.
 
-## End-to-end demo
+Three model families are supported, and one binary handles all of them: the
+architecture is recorded as `moss.architecture` in the GGUF and dispatched on at
+run time.
 
-```bash
-$ ./build/moss-tts-cli \
-    --model /mnt/win/k/models/openmoss/moss-tts-q8_0.gguf \
-    --text "The quick brown fox jumps over the lazy dog, and once again proves \
-that pangram-style text remains the simplest way to exercise a speech \
-synthesis system." \
-    --max-new-tokens 600 --n-gpu-layers 99 --output /tmp/out.wav
-…
-[generate] prompt_len = 95 tokens
-[generate] prefill done in 0.04s
-[generate] stop at step 161
-[generate] generated 161 steps in 3.81s (42.2 tok/s)
-[generate] 127 audio frames extracted
-[generate] codec decode produced 243840 samples (10.16s of audio) in 0.20s
-wrote 243840 samples (10.16s) to /tmp/out.wav
-```
+| Family | Arch id | Shape | Output |
+|---|---|---|---|
+| MOSS-TTS / v1.5 / VoiceGenerator | `moss_tts_delay` | Qwen3-8B, 32 RVQ codebooks on a delay pattern, MOSS-Audio-Tokenizer v1 | 24 kHz mono |
+| MOSS-TTS-Local-Transformer-v1.5 | `moss_tts_local` | Qwen3-4B, 12 codebooks emitted per frame by a 1-layer depth transformer, MOSS-Audio-Tokenizer v2 | 48 kHz stereo |
+| MOSS-SoundEffect-v2.0 | `moss_soundeffect` | **not autoregressive** — a 30-block Wan-style DiT sampled by flow matching, Qwen3-1.7B text encoder, continuous DAC VAE | 48 kHz mono |
 
-10 seconds of synthesised speech in 4 seconds wall-clock on a single 16 GB GPU
-(RTX 5060 Ti). The codec graph runs in 0.2 s for 10 s of audio (~50× real-time).
+Published weights: [ilintar/moss-tts-gguf](https://huggingface.co/ilintar/moss-tts-gguf),
+[ilintar/moss-tts-local-gguf](https://huggingface.co/ilintar/moss-tts-local-gguf),
+[ilintar/moss-soundeffect-gguf](https://huggingface.co/ilintar/moss-soundeffect-gguf).
 
-## Server usage
+## What works
 
-```bash
-$ ./build/moss-tts-server \
-    --model /mnt/win/k/models/openmoss/moss-tts-q8_0.gguf \
-    --port 18080 &
-[server] model loaded; codec=on
-[server] listening on http://127.0.0.1:18080
+| Area | Status |
+|---|---|
+| GGUF converter (all three families) | done — backbone GGUF + `moss.*` sidecar, optional `--sidecar-dtype q8_0` |
+| Delay-pattern generation + codec v1 | done, validated |
+| MOSS-TTS-Local: depth transformer + codec v2 | done, validated exactly against the reference |
+| Voice cloning (codec encoder) | done — round-trip envelope correlation 0.995 |
+| Continuation mode (`ref_text`) | done for `moss_tts_local`, prompt ids exact |
+| MOSS-SoundEffect: DiT, DAC VAE, flow matching | done, verified seam by seam |
+| CLI | one binary, dispatches on architecture |
+| HTTP server | `/tts`, `/sfx`, `/v1/audio/speech`, `/v1/models`, `/v1/audio/voices`, wav + pcm |
+| WebUI | served at `/` by the server |
+| Quantization | backbone via `llama-quantize`; sidecar via the converter |
 
-$ curl -s http://127.0.0.1:18080/info | jq .
-{
-  "audio_vocab_size": 1024,  "codec_loaded": true,  "codec_present": true,
-  "frame_rate_hz": 12.5,     "hidden_size": 4096,   "n_vq": 32,
-  "requests_served": 0,      "sampling_rate": 24000
-}
+## Not done
 
-$ curl -s -X POST http://127.0.0.1:18080/tts \
-    -H 'Content-Type: application/json' \
-    -d '{"text":"Hello from the persistent server.","max_new_tokens":300}' \
-    -o out.wav -w '%{http_code} %{size_download}B %{time_total}s\n'
-200 99884B 1.69s
+- **Streaming.** The LM half is already incremental; the codec is not. See
+  [STREAMING.md](STREAMING.md) — it needs a per-stage KV cache, and the
+  measured reason why chunking cannot substitute is documented there.
+- **Continuation mode for `moss_tts_delay`.** Different slot layout, no verified
+  reference locally; `ref_text` is rejected for that family rather than silently
+  ignored.
+- **Server concurrency.** One mutex serialises generation. Multi-user would need
+  `llama_seq_id` plumbed through the batch and a per-request allocator.
 
-# Voice cloning: embed the reference WAV as base64 in the JSON request.
-$ python3 -c "import base64,json,sys; \
-    print(json.dumps({'text': sys.argv[1], 'max_new_tokens': 600, \
-        'reference_wav_b64': base64.b64encode(open(sys.argv[2],'rb').read()).decode()}))" \
-    "A different sentence in the cloned voice." /tmp/out_long.wav > /tmp/req.json
-$ curl -s -X POST http://127.0.0.1:18080/tts \
-    -H 'Content-Type: application/json' --data @/tmp/req.json \
-    -o cloned.wav -w '%{http_code} %{size_download}B %{time_total}s\n'
-200 188204B 2.40s
-```
+## How correctness is established
 
-## Pipeline data flow (current)
+Generated audio is a poor test — sampling and 100 solver steps both amplify tiny
+numerical differences — so everything is verified at *seams*, feeding both the
+port and the PyTorch reference identical input bytes.
 
-```
-text  ─▶ Tokenizer (libllama BPE)
-        │
-        ▼ token ids (S, 33) int32, col 0 = text id, cols 1..32 = audio_pad_code
-   compute_input_embeddings                        [GGML on CUDA aux backend]
-   ├── get_rows(text_embed, col0)
-   └── + Σᵢ get_rows(audio_embed_i, col_{i+1})  → (S, 4096) f32
-        │
-        ▼
-   llama_decode(batch.embd) — prefill
-        │
-        ▼
-   ╔═╣ generation loop (per step, until is_stopping) ╠═══════════╗
-   ║  text_logits = llama_get_logits_ith(-1)                     ║
-   ║  hidden      = llama_get_embeddings_ith(-1)                 ║
-   ║  audio_logits = compute_audio_logits(hidden) [GGML CUDA]    ║
-   ║  next_ids   = DelayState.step(text_logits, audio_logits)    ║
-   ║  next_emb   = compute_input_embeddings(next_ids, 1)         ║
-   ║  llama_decode(next_emb)                                     ║
-   ╚═════════════════════════════════════════════════════════════╝
-        │
-        ▼ DelayState.extract_audio_codes (forward-search for first <audio_start>)
-   (n_vq, T_audio) int32
-        │
-        ▼ codec.decode                              [GGML on CUDA aux backend]
-   ┌─────────────────────────────────────────────────────────────┐
-   │ ① Σᵢ q.{i}.oproj( codebook[i][codes[i]] ) → (512, T)        │
-   │ ② quantizer.oproj    → (768, T)                              │
-   │ ③ dec.0  iproj + 32 transformer layers @ d=1280              │
-   │    └─ patch=2 upsample → (640, 2T)                           │
-   │ ④ dec.2  iproj + 12 layers @ d=768   → (768, 2T)             │
-   │    └─ patch=2 upsample → (384, 4T)                           │
-   │ ⑤ dec.4  iproj + 12 layers @ d=768   → (768, 4T)             │
-   │    └─ patch=2 upsample → (384, 8T)                           │
-   │ ⑥ dec.6  iproj + 12 layers @ d=768 + oproj → (240, 8T)       │
-   │    └─ patch=240 upsample → (1, 1920·T)                        │
-   └─────────────────────────────────────────────────────────────┘
-        │
-        ▼ waveform f32 @ 24 kHz, length T_audio·1920
-   write_wav_mono → out.wav
-```
+| Probe | Checks |
+|---|---|
+| `moss-prompt-probe` | prompt grid ids vs the reference processor. No tolerance: plain, voice-clone and continuation layouts all match **every integer** |
+| `moss-local-probe` | the depth transformer from a fixed hidden state |
+| `moss-sfx-probe` | the DiT at 8 seams, at 16 and 1500 frames |
+| `moss-sfx-vae-probe` | the DAC decoder at 10 seams, plus a chunking check that must be bit-identical |
+| `moss-codec-causality` | whether the codec decoder is causal, and how much history a chunk needs |
+| `moss-codec-roundtrip` | encode→decode envelope correlation, compared first half vs second half |
 
-## What's in the codebase
+Two lessons worth carrying to any similar port:
 
-| File                                           | Role                                                     |
-|------------------------------------------------|----------------------------------------------------------|
-| `scripts/convert_hf_to_gguf.py`                | HF → backbone GGUF + sidecar GGUF                        |
-| `src/aux_internal.h`                           | Shared `Model::Aux` definition (model.cpp + codec.cpp)   |
-| `src/model.cpp`                                | Two-file loader, aux backend, embed/head compute graphs  |
-| `src/codec.cpp`                                | RLFQ + 4-stage transformer decoder graph                 |
-| `src/tokenizer.cpp`                            | libllama BPE wrapper                                     |
-| `src/delay.cpp`                                | DelayState + sampling (top-k/p, rep penalty, multinomial)|
-| `src/pipeline.cpp`                             | Prompt builder + autoregressive generation loop + codec  |
-| `src/wav.cpp`                                  | RIFF/WAVE I/O, no libsndfile dep                         |
-| `src/cli/moss_tts_cli.cpp`                     | CLI entry point                                          |
-| `src/server/moss_tts_server.cpp`               | HTTP server: `/health`, `/info`, `/tts`, `/v1/audio/speech` + static WebUI mount |
-| `webui/`                                       | Browser WebUI (vanilla HTML/CSS/JS, IndexedDB history)   |
-| `scripts/launch-webui.{sh,bat}`                | Server + WebUI launcher                                  |
-| `third_party/cpp-httplib/httplib.h`            | Single-header HTTP library (vendored from upstream v0.18.7) |
-| `third_party/llama.cpp`                        | llama.cpp submodule (libllama + ggml), built in-tree     |
-| `tests/moss_tts_info.cpp`                      | Diagnostic: load, dump dims                              |
-| `tests/moss_tts_compute.cpp`                   | Smoke test for embedding + audio-head graphs             |
-| `tests/moss_codec_roundtrip.cpp`               | Codec encode→decode round-trip + per-codebook stats      |
+**Establish the f16 budget before judging any number.** Rerun the reference with
+its weights round-tripped through f16 (`p.copy_(p.half().float())`). For the DiT
+that floor is ~2e-4 at every seam and it does *not* accumulate with depth, so
+anything much above it is a bug rather than "f16 being lossy".
 
-## Notable bugs fixed during codec/encoder bring-up
+**ggml's Vulkan backend accumulates matmuls in f16 by default.** Any node left at
+`GGML_PREC_DEFAULT` costs ~5e-3 to 1e-2 relative — far more than f16 weights.
+This was found three separate times: in the DiT, in libllama's own graph (fixed
+with `--vk-f32`, which sets `GGML_VK_DISABLE_F16`), and in the codec. It hides
+because matrix-*vector* products take a different, f32-accumulating path, so
+anything computed one token at a time looks perfect while every batched seam is
+uniformly wrong.
 
-1. **DelayState post-mask sentinel overflow** (`src/delay.cpp`). The pre/post
-   audio mask used `INT64_MAX` for the "no delay yet" sentinel and computed
-   `post = (delayed - 1) < i`. With the sentinel, that always evaluates to
-   `false`, silently skipping every audio codebook during warm-up. Fixed by
-   branching on the sentinel explicitly.
+## Performance
 
-2. **`extract_audio_codes` searched for `audio_start OR gen_slot`** and
-   landed on the *last* gen_slot row, leaving T ≈ n_vq and T_audio ≈ 0.
-   Fixed to search backwards for `audio_start` only. (Backward search is
-   correct for both vanilla TTS and voice cloning: the trailing
-   `<audio_start>` of the assistant prompt is always the one that bounds
-   the generated segment, while any earlier `<audio_start>` rows belong to
-   user-supplied reference audio.)
+Radeon 8060S (Strix Halo, Vulkan), 123 GB unified memory.
 
-Both bugs only surface once the codec is actually invoked, which is why
-they slipped past the LM-only smoke tests in tasks 3-4.
+| | Rate |
+|---|---|
+| MOSS-TTS-Delay backbone, Q8 | ~22 tok/s |
+| MOSS-TTS-Local backbone, Q8 | ~22 frames/s (1.74x real time) |
+| Codec decode | ~30x real time (40 s of audio in 1.10 s) |
+| MOSS-SoundEffect, 100 steps | ~90 s regardless of duration — the DiT always denoises 30 s |
+| MOSS-SoundEffect VAE decode | 0.99 s for 3 s of audio, 7.7 s for 30 s |
 
-3. **Codec attention missing the 10 s sliding window** (`src/codec.cpp`,
-   issue #7). The codec transformers are trained with a windowed causal mask
-   (`causal_transformer_context_duration` = 10 s → per-stage window of
-   frame_rate × 10 keys: 125/250/500/1000 for the decoder, mirrored for the
-   encoder; upstream `attn_bias = (delta >= 0) & (delta < context)`). Our
-   masks were plain lower-triangular, so past 10 s every layer attended over
-   RoPE distances never seen in training and audio degraded progressively
-   (crackling, robotic voice, falling volume). Verified with a 40 s
-   encode→decode round-trip: envelope correlation fell from 0.999 to ~0.96
-   after the 10 s mark with the unbounded mask, and stays ≥ 0.999 end-to-end
-   with the banded mask.
-
-4. **Repetition penalty compounded per occurrence** (`src/delay.cpp`). The
-   reference penalizes `torch.unique(prev_tokens)` — each token once — while
-   we penalized per occurrence, i.e. penalty^k for a token seen k times. With
-   a 1024-code audio vocab at 12.5 frames/s this distorts the distribution
-   more every second. Invisible at the library default penalty of 1.0, but
-   the server defaults to 1.1.
-
-## Open issues / future work
-
-- **Multi-GPU layout.** Both the CLI and the server pin the entire model
-  (libllama backbone + aux backend for codec/embed/heads) to a single GPU
-  via `LLAMA_SPLIT_MODE_NONE`. The picked device defaults to the GPU with
-  the most free VRAM at load time; override with `--main-gpu N` (index into
-  the ggml GPU device list, same convention as libllama). This avoids the
-  cross-device OOM that happens when libllama splits the backbone across
-  GPUs while the aux backend lands on whichever device it picks first.
-- **Backbone fits at FP16 only on >24 GB GPUs.** Use `llama-quantize` with
-  `--token-embedding-type f16` so CUDA's `ggml_get_rows` can still index the
-  embedding table (it doesn't support quantised src0).
-- **Per-step graph rebuild** in `compute_input_embeddings` /
-  `compute_audio_logits`. For codec decode the graph is rebuilt only once
-  (called at the end of generation), so this is fine.
-- **Server multi-user concurrency** would need `llama_seq_id` plumbed through
-  the backbone batch and the `m_aux->galloc` made per-request. Today a single
-  `std::mutex` serializes all generations, which keeps the implementation
-  simple at the cost of throughput under concurrent load. Verified with two
-  parallel curls: r1 finishes at ~1.3 s, r2 at ~2.7 s = r1 + r2's own work.
-- **Streaming output** for the server would require chunked codec decode +
-  the `StreamCallback` typedef in `pipeline.h` (currently unused).
+`--cfg-scale 1` halves SoundEffect's solve by skipping the unconditional branch.
+`--vk-f32` is recommended on Vulkan and costs nothing measurable.
