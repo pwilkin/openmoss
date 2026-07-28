@@ -43,11 +43,13 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -225,6 +227,40 @@ public:
     std::vector<float>   decode(const int32_t * codes, int32_t n_vq, int32_t T_audio);
     std::vector<int32_t> encode(const float * waveform, int64_t n_samples, int32_t & T_audio_out);
 
+    // ── Incremental decode ─────────────────────────────────────────────────
+    //
+    // One StreamState per in-flight utterance; CodecGraphs itself stays
+    // stateless so a single Model can serve several streams.
+    //
+    // Each stage keeps the K/V for the positions its next queries can still
+    // reach — `context - 1` of them, since a query at p attends (p-context, p].
+    // The cache lives on the host and is handed to each push's graph as an
+    // input, which keeps the graph free of in-graph mutation (the same trade
+    // src/local_transformer.cpp makes for the depth transformer). The price is
+    // that every push re-uploads the whole cache — 44.3 M floats, 177 MB — and
+    // reads the new K/V back, so a small push is dominated by that fixed cost
+    // rather than by its own compute: measured, 51 ms for one frame against
+    // 70 ms for eight. Even so the codec holds 1.6x real time at single-frame
+    // granularity and 9x at eight frames, against an LM that runs at 1.74x, so
+    // the transfer has never been the constraint. If it ever becomes one, the
+    // fix is backend-resident ring buffers written with ggml_cpy, the way
+    // libllama handles its own KV cache.
+    struct StreamState {
+        struct LayerKV {
+            std::vector<float> k, v;   // (head_dim, n_head, n_cached) f32, post-RoPE
+        };
+        struct StageKV {
+            std::vector<LayerKV> layers;
+            int64_t n_cached = 0;      // positions held, <= context - 1
+            int64_t next_pos = 0;      // global position of this stage's next query
+        };
+        std::vector<StageKV> stages;
+        int32_t n_vq = 0;
+    };
+
+    void               stream_reset(StreamState & st, int32_t n_vq) const;
+    std::vector<float> stream_push(StreamState & st, const int32_t * codes, int32_t T_audio);
+
 private:
     Model & m_owner;
 
@@ -275,6 +311,11 @@ private:
     std::vector<Stage> m_enc_stages;  // encoder stages (enc.1/3/5/… )
 
     ggml_gallocr_t m_galloc = nullptr;
+    // Streaming gets its own allocator. ggml_gallocr_needs_realloc compares node
+    // shapes but ignores output flags, so a graph that taps K/V can otherwise
+    // inherit the plan of an untapped one and read whatever got recycled into
+    // those buffers. Batch and streaming graphs must never share a gallocr.
+    ggml_gallocr_t m_stream_galloc = nullptr;
 
     // ── private helpers ──
     ggml_tensor * tensor_(const std::string & name) const;
@@ -302,29 +343,52 @@ private:
     // ~T * (chunk + context), and the attention FLOPs drop from O(T^2) to
     // O(T * context). One block covering everything reproduces the old
     // behaviour exactly, which is what short stages get.
+    //
+    // Block coordinates are *global* positions, which is what makes the same
+    // plan serve the streaming path: there, the queries start partway into the
+    // utterance and the keys start earlier still, so `q_origin` / `k_origin`
+    // record where each tensor's local index 0 sits. Both are 0 for a batch
+    // decode, where local and global indices coincide.
     struct AttnPlan {
         struct Block {
-            int64_t q0 = 0, q1 = 0;   // query range
-            int64_t k0 = 0;           // first reachable key
+            int64_t q0 = 0, q1 = 0;   // query range, global
+            int64_t k0 = 0;           // first reachable key, global
             ggml_tensor * mask = nullptr;   // (n_kv, n_q) f16
         };
-        int64_t T = 0;
-        int64_t context = 0;
+        int64_t q_origin = 0;   // global position of query tensor index 0
+        int64_t k_origin = 0;   // global position of key tensor index 0
+        int64_t context  = 0;
         std::vector<Block> blocks;
+    };
+
+    // Streaming attachment for one layer: the cached K/V its queries can still
+    // reach, and where to hand back the K/V it computes so the caller can append
+    // them. Null everywhere on the batch path.
+    struct StreamTap {
+        ggml_tensor *  k_prev = nullptr;   // (head_dim, n_head, n_prev) f32, post-RoPE
+        ggml_tensor *  v_prev = nullptr;
+        int64_t        n_prev = 0;
+        ggml_tensor ** k_out  = nullptr;   // receives (head_dim, n_head, n_new)
+        ggml_tensor ** v_out  = nullptr;
     };
 
     ggml_tensor * build_attention_(ggml_context * gctx, ggml_tensor * x,
                                     const Layer & L, int d_model, int n_heads,
-                                    ggml_tensor * pos, const AttnPlan & plan) const;
+                                    ggml_tensor * pos, const AttnPlan & plan,
+                                    const StreamTap * tap) const;
     ggml_tensor * build_ffn_(ggml_context * gctx, ggml_tensor * x,
                               const Layer & L) const;
     ggml_tensor * build_layer_(ggml_context * gctx, ggml_tensor * x,
                                 const Layer & L, int d_model, int n_heads,
-                                ggml_tensor * pos, const AttnPlan & plan) const;
+                                ggml_tensor * pos, const AttnPlan & plan,
+                                const StreamTap * tap) const;
     ggml_tensor * build_stage_(ggml_context * gctx, ggml_tensor * x,
                                 const Stage & S, ggml_tensor * pos,
-                                const AttnPlan & plan) const;
-    static AttnPlan make_attn_plan_(ggml_context * gctx, int64_t T, int64_t context);
+                                const AttnPlan & plan,
+                                StreamTap * taps) const;
+    static AttnPlan make_attn_plan_(ggml_context * gctx,
+                                    int64_t q_origin, int64_t n_q,
+                                    int64_t k_origin, int64_t context);
     static void     fill_attn_plan_(const AttnPlan & plan);
     static ggml_tensor * patch_upsample_(ggml_context * gctx,
                                           ggml_tensor * x, int patch);
@@ -353,9 +417,12 @@ CodecGraphs::CodecGraphs(Model & owner) : m_owner(owner) {
 
     m_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(aux->backend));
     if (!m_galloc) throw std::runtime_error("CodecGraphs: gallocr_new failed");
+    m_stream_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(aux->backend));
+    if (!m_stream_galloc) throw std::runtime_error("CodecGraphs: gallocr_new (stream) failed");
 }
 
 CodecGraphs::~CodecGraphs() {
+    if (m_stream_galloc) ggml_gallocr_free(m_stream_galloc);
     if (m_galloc) ggml_gallocr_free(m_galloc);
     if (m_w_buf)  ggml_backend_buffer_free(m_w_buf);
     if (m_w_ctx)  ggml_free(m_w_ctx);
@@ -711,7 +778,8 @@ ggml_tensor * CodecGraphs::build_attention_(ggml_context * gctx,
                                              int d_model,
                                              int n_heads,
                                              ggml_tensor * pos,
-                                             const AttnPlan & plan) const {
+                                             const AttnPlan & plan,
+                                             const StreamTap * tap) const {
     const int head_dim = d_model / n_heads;
     const int T        = int(x->ne[1]);
 
@@ -751,6 +819,22 @@ ggml_tensor * CodecGraphs::build_attention_(ggml_context * gctx,
     // materialised scores) and runs the same well-exercised kernel the llama
     // backbone uses, so it works on every backend we target.
     //
+    // Streaming hands back the K/V for the new positions — post-RoPE, before the
+    // permute, so the cache layout is the natural (head_dim, n_head, n_pos) one
+    // and appending to it on the host is a single memcpy. The cached prefix then
+    // joins along the same axis, which is exactly what the batch path would have
+    // computed for those positions.
+    if (tap) {
+        *tap->k_out = K;
+        *tap->v_out = V;
+        ggml_set_output(K);
+        ggml_set_output(V);
+        if (tap->n_prev > 0) {
+            K = ggml_concat(gctx, tap->k_prev, K, 2);   // (head_dim, n_head, n_kv)
+            V = ggml_concat(gctx, tap->v_prev, V, 2);
+        }
+    }
+
     // Layout flash_attn_ext expects: q/k/v = (head_dim, T, n_heads).
     ggml_tensor * Qp = ggml_cont(gctx, ggml_permute(gctx, Q, 0, 2, 1, 3));   // (head_dim, T, n_heads) f32
     ggml_tensor * Kp = ggml_cont(gctx, ggml_permute(gctx, K, 0, 2, 1, 3));
@@ -763,6 +847,12 @@ ggml_tensor * CodecGraphs::build_attention_(ggml_context * gctx,
 
     const float scale = 1.0f / std::sqrt(float(head_dim));
 
+    // Extents of the tensors the blocks index into. On the batch path both are
+    // T; streaming has fewer queries than keys, since the keys carry the cached
+    // prefix as well.
+    const int64_t n_q_total  = Qp->ne[1];
+    const int64_t n_kv_total = Kh->ne[1];
+
     // One flash-attention call per query chunk, each seeing only the keys its
     // queries can actually reach. Results concatenate along the time axis.
     ggml_tensor * attn = nullptr;
@@ -773,18 +863,18 @@ ggml_tensor * CodecGraphs::build_attention_(ggml_context * gctx,
         ggml_tensor * q = Qp;
         ggml_tensor * k = Kh;
         ggml_tensor * v = Vh;
-        if (n_q != T) {
+        if (n_q != n_q_total) {
             q = ggml_cont(gctx, ggml_view_3d(gctx, Qp, head_dim, n_q, n_heads,
                                              Qp->nb[1], Qp->nb[2],
-                                             size_t(b.q0) * Qp->nb[1]));
+                                             size_t(b.q0 - plan.q_origin) * Qp->nb[1]));
         }
-        if (n_kv != T) {
+        if (n_kv != n_kv_total) {
             k = ggml_cont(gctx, ggml_view_3d(gctx, Kh, head_dim, n_kv, n_heads,
                                              Kh->nb[1], Kh->nb[2],
-                                             size_t(b.k0) * Kh->nb[1]));
+                                             size_t(b.k0 - plan.k_origin) * Kh->nb[1]));
             v = ggml_cont(gctx, ggml_view_3d(gctx, Vh, head_dim, n_kv, n_heads,
                                              Vh->nb[1], Vh->nb[2],
-                                             size_t(b.k0) * Vh->nb[1]));
+                                             size_t(b.k0 - plan.k_origin) * Vh->nb[1]));
         }
 
         ggml_tensor * a = ggml_flash_attn_ext(gctx, q, k, v, b.mask, scale,
@@ -816,10 +906,11 @@ ggml_tensor * CodecGraphs::build_layer_(ggml_context * gctx,
                                          int d_model,
                                          int n_heads,
                                          ggml_tensor * pos,
-                                         const AttnPlan & plan) const {
+                                         const AttnPlan & plan,
+                                         const StreamTap * tap) const {
     // attn block
     ggml_tensor * y = build_layer_norm_(gctx, x, L.norm1_w, L.norm1_b);
-    y = build_attention_(gctx, y, L, d_model, n_heads, pos, plan);
+    y = build_attention_(gctx, y, L, d_model, n_heads, pos, plan, tap);
     y = ggml_mul(gctx, y, to_f32_(gctx, L.layer_scale_1));
     x = ggml_add(gctx, x, y);
 
@@ -837,10 +928,12 @@ ggml_tensor * CodecGraphs::build_stage_(ggml_context * gctx,
                                          ggml_tensor * x,
                                          const Stage & S,
                                          ggml_tensor * pos,
-                                         const AttnPlan & plan) const {
+                                         const AttnPlan & plan,
+                                         StreamTap * taps) const {
     if (S.iproj) x = mm_(gctx, S.iproj, x);
-    for (const Layer & L : S.layers) {
-        x = build_layer_(gctx, x, L, S.spec.d_model, S.spec.n_heads, pos, plan);
+    for (size_t li = 0; li < S.layers.size(); ++li) {
+        x = build_layer_(gctx, x, S.layers[li], S.spec.d_model, S.spec.n_heads,
+                         pos, plan, taps ? &taps[li] : nullptr);
     }
     if (S.oproj) x = mm_(gctx, S.oproj, x);
     return x;
@@ -852,23 +945,26 @@ ggml_tensor * CodecGraphs::build_stage_(ggml_context * gctx,
 static constexpr int64_t ATTN_CHUNK = 1024;
 
 CodecGraphs::AttnPlan CodecGraphs::make_attn_plan_(ggml_context * gctx,
-                                                   int64_t T, int64_t context) {
+                                                   int64_t q_origin, int64_t n_q,
+                                                   int64_t k_origin, int64_t context) {
     AttnPlan plan;
-    plan.T       = T;
-    plan.context = context;
-    if (T <= 0) return plan;
+    plan.q_origin = q_origin;
+    plan.k_origin = k_origin;
+    plan.context  = context;
+    if (n_q <= 0) return plan;
 
     // Short stages stay in one block, which is bit-for-bit the previous
     // behaviour: a single (T, T) mask and one flash-attention call.
-    const int64_t chunk = (T <= ATTN_CHUNK) ? T : ATTN_CHUNK;
+    const int64_t chunk = (n_q <= ATTN_CHUNK) ? n_q : ATTN_CHUNK;
+    const int64_t q_end = q_origin + n_q;
 
-    for (int64_t q0 = 0; q0 < T; q0 += chunk) {
+    for (int64_t q0 = q_origin; q0 < q_end; q0 += chunk) {
         AttnPlan::Block b;
         b.q0 = q0;
-        b.q1 = std::min(q0 + chunk, T);
+        b.q1 = std::min(q0 + chunk, q_end);
         // Query q reaches back to q - context + 1; the earliest query in this
-        // block therefore bounds the key window.
-        b.k0 = (context > 0) ? std::max<int64_t>(0, q0 - context + 1) : 0;
+        // block therefore bounds the key window, clamped to the keys we hold.
+        b.k0 = (context > 0) ? std::max(k_origin, q0 - context + 1) : k_origin;
         b.mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, b.q1 - b.k0, b.q1 - b.q0);
         ggml_set_input(b.mask);
         plan.blocks.push_back(b);
@@ -1042,7 +1138,8 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
         pos_T[s] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T_at[s]);
         ggml_set_name(pos_T[s], ("pos_" + std::to_string(s)).c_str());
         ggml_set_input(pos_T[s]);
-        plan_T[s] = make_attn_plan_(gctx, T_at[s], m_stages[s].spec.context);
+        plan_T[s] = make_attn_plan_(gctx, /*q_origin=*/0, T_at[s],
+                                    /*k_origin=*/0, m_stages[s].spec.context);
     }
 
     // ── Quantizer.decode_codes ─────────────────────────────────────────────
@@ -1061,7 +1158,7 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
 
     // Transformer stages, each followed by a patch upsample.
     for (size_t s = 0; s < n_stages; ++s) {
-        x = build_stage_(gctx, x, m_stages[s], pos_T[s], plan_T[s]);
+        x = build_stage_(gctx, x, m_stages[s], pos_T[s], plan_T[s], /*taps=*/nullptr);
         if (m_stages[s].spec.patch_after > 0) {
             x = patch_upsample_(gctx, x, m_stages[s].spec.patch_after);
         }
@@ -1105,6 +1202,232 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
     std::vector<float> wav;
     wav.resize(size_t(n_samples));
     ggml_backend_tensor_get(waveform, wav.data(), 0, wav.size() * sizeof(float));
+
+    ggml_free(gctx);
+    return wav;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Incremental decode
+// ───────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Append `add` (n_add positions of `d` floats) to a per-layer cache and drop
+// whatever falls out of the window. Positions are the outermost axis, so both
+// the append and the trim are single memmoves.
+void kv_append_(std::vector<float> & cur, const std::vector<float> & add,
+                int64_t d, int64_t keep) {
+    if (keep <= 0) { cur.clear(); return; }
+    const int64_t n_add = int64_t(add.size()) / d;
+    if (n_add >= keep) {
+        cur.assign(add.end() - size_t(keep * d), add.end());
+        return;
+    }
+    const int64_t n_cur = int64_t(cur.size()) / d;
+    const int64_t drop  = std::max<int64_t>(0, n_cur + n_add - keep);
+    if (drop > 0) cur.erase(cur.begin(), cur.begin() + size_t(drop * d));
+    cur.insert(cur.end(), add.begin(), add.end());
+}
+
+} // namespace
+
+void CodecGraphs::stream_reset(StreamState & st, int32_t n_vq) const {
+    if (!m_owner.codec_present()) {
+        throw std::runtime_error("CodecGraphs::stream_reset: codec tensors not loaded "
+                                 "(rebuild with --codec, and don't pass --skip-codec)");
+    }
+    if (n_vq < 1 || n_vq > CODEC_NUM_VQ) {
+        throw std::runtime_error("CodecGraphs::stream_reset: n_vq must be 1.."
+                                 + std::to_string(CODEC_NUM_VQ) + ", got "
+                                 + std::to_string(n_vq));
+    }
+    st.n_vq = n_vq;
+    st.stages.assign(m_stages.size(), StreamState::StageKV{});
+    for (size_t s = 0; s < m_stages.size(); ++s) {
+        st.stages[s].layers.resize(m_stages[s].layers.size());
+    }
+}
+
+std::vector<float> CodecGraphs::stream_push(StreamState & st,
+                                             const int32_t * codes,
+                                             int32_t T_audio) {
+    auto * aux = m_owner.aux();
+    if (!aux || !aux->backend) {
+        throw std::runtime_error("CodecGraphs::stream_push: aux backend not initialised");
+    }
+    if (st.stages.size() != m_stages.size()) {
+        throw std::runtime_error("CodecGraphs::stream_push: state was not initialised "
+                                 "by stream_reset");
+    }
+    if (T_audio <= 0) return {};
+    const int32_t n_vq = st.n_vq;
+
+    const size_t n_stages = m_stages.size();
+
+    // Per-stage geometry for this push. Each PatchedPretransform multiplies the
+    // frame rate, so a stage sees `patch` times as many new positions as the one
+    // above it — and its window, measured in its own frames, is already scaled
+    // to match in the stage table.
+    std::vector<int64_t> n_new(n_stages), p0(n_stages), n_prev(n_stages), keep(n_stages);
+    {
+        int64_t nn = T_audio;
+        for (size_t s = 0; s < n_stages; ++s) {
+            n_new[s]  = nn;
+            p0[s]     = st.stages[s].next_pos;
+            n_prev[s] = st.stages[s].n_cached;
+            // A query at p attends (p - context, p], so the oldest key the next
+            // chunk can reach is p - context + 1: context-1 positions of history.
+            keep[s]   = std::max<int64_t>(0, m_stages[s].spec.context - 1);
+            if (m_stages[s].spec.patch_after > 0) nn *= m_stages[s].spec.patch_after;
+        }
+    }
+
+    const int64_t n_samples = int64_t(T_audio) * m_owner.dims().samples_per_frame();
+
+    // ── Build graph ────────────────────────────────────────────────────────
+    ggml_init_params ip{};
+    ip.mem_size   = ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false);
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    ggml_context * gctx = ggml_init(ip);
+    if (!gctx) throw std::runtime_error("CodecGraphs::stream_push: ggml_init failed");
+
+    std::vector<ggml_tensor *> codes_in;
+    codes_in.resize(size_t(n_vq));
+    for (int i = 0; i < n_vq; ++i) {
+        codes_in[size_t(i)] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T_audio);
+        ggml_set_name(codes_in[size_t(i)], ("codes_" + std::to_string(i)).c_str());
+        ggml_set_input(codes_in[size_t(i)]);
+    }
+
+    std::vector<ggml_tensor *>              pos_T(n_stages, nullptr);
+    std::vector<AttnPlan>                   plan_T(n_stages);
+    std::vector<std::vector<StreamTap>>     taps(n_stages);
+    std::vector<std::vector<ggml_tensor *>> k_new(n_stages), v_new(n_stages);
+
+    for (size_t s = 0; s < n_stages; ++s) {
+        const StageSpec & sp = m_stages[s].spec;
+        pos_T[s] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_new[s]);
+        ggml_set_name(pos_T[s], ("pos_" + std::to_string(s)).c_str());
+        ggml_set_input(pos_T[s]);
+        plan_T[s] = make_attn_plan_(gctx, p0[s], n_new[s],
+                                    p0[s] - n_prev[s], sp.context);
+
+        const size_t n_layers = m_stages[s].layers.size();
+        const int64_t head_dim = sp.d_model / sp.n_heads;
+        taps[s].resize(n_layers);
+        k_new[s].assign(n_layers, nullptr);
+        v_new[s].assign(n_layers, nullptr);
+        for (size_t li = 0; li < n_layers; ++li) {
+            StreamTap & tp = taps[s][li];
+            tp.n_prev = n_prev[s];
+            tp.k_out  = &k_new[s][li];
+            tp.v_out  = &v_new[s][li];
+            if (n_prev[s] > 0) {
+                tp.k_prev = ggml_new_tensor_3d(gctx, GGML_TYPE_F32,
+                                               head_dim, sp.n_heads, n_prev[s]);
+                tp.v_prev = ggml_new_tensor_3d(gctx, GGML_TYPE_F32,
+                                               head_dim, sp.n_heads, n_prev[s]);
+                ggml_set_input(tp.k_prev);
+                ggml_set_input(tp.v_prev);
+            }
+        }
+    }
+
+    // Quantizer front-end is per-frame, so it is unchanged from the batch path.
+    ggml_tensor * sum = nullptr;
+    for (int i = 0; i < n_vq; ++i) {
+        ggml_tensor * z = ggml_get_rows(gctx, m_codebook[size_t(i)], codes_in[size_t(i)]);
+        z = mm_(gctx, m_q_oproj_w[size_t(i)], z);
+        z = ggml_add(gctx, z, to_f32_(gctx, m_q_oproj_b[size_t(i)]));
+        sum = sum ? ggml_add(gctx, sum, z) : z;
+    }
+    ggml_tensor * x = mm_(gctx, m_quant_oproj_w, sum);
+    x = ggml_add(gctx, x, to_f32_(gctx, m_quant_oproj_b));
+
+    for (size_t s = 0; s < n_stages; ++s) {
+        x = build_stage_(gctx, x, m_stages[s], pos_T[s], plan_T[s], taps[s].data());
+        if (m_stages[s].spec.patch_after > 0) {
+            x = patch_upsample_(gctx, x, m_stages[s].spec.patch_after);
+        }
+    }
+
+    ggml_tensor * waveform = ggml_reshape_1d(gctx, x, n_samples);
+    ggml_set_name(waveform, "waveform");
+    ggml_set_output(waveform);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(gctx, 16384, false);
+    ggml_build_forward_expand(graph, waveform);
+    // The K/V taps hang off the attention branch, so they are already reachable
+    // from `waveform` — but expand them explicitly: a stage whose cache is
+    // still empty has nothing forcing the tap to be kept alive on its own.
+    for (size_t s = 0; s < n_stages; ++s) {
+        for (size_t li = 0; li < k_new[s].size(); ++li) {
+            ggml_build_forward_expand(graph, k_new[s][li]);
+            ggml_build_forward_expand(graph, v_new[s][li]);
+        }
+    }
+
+    if (!ggml_gallocr_alloc_graph(m_stream_galloc, graph)) {
+        ggml_free(gctx);
+        throw std::runtime_error("CodecGraphs::stream_push: gallocr_alloc_graph failed");
+    }
+
+    // ── Upload inputs ──────────────────────────────────────────────────────
+    {
+        std::vector<int32_t> col;
+        col.resize(size_t(T_audio));
+        for (int i = 0; i < n_vq; ++i) {
+            for (int t = 0; t < T_audio; ++t) col[size_t(t)] = codes[i * T_audio + t];
+            ggml_backend_tensor_set(codes_in[size_t(i)], col.data(), 0,
+                                    col.size() * sizeof(int32_t));
+        }
+    }
+    for (size_t s = 0; s < n_stages; ++s) {
+        // RoPE positions are global — a chunk starting at frame 400 must see the
+        // same rotations the batch decode gave frame 400, or the cached keys it
+        // attends over are in a different frame of reference than its queries.
+        std::vector<int32_t> p(size_t(n_new[s]));
+        for (int64_t t = 0; t < n_new[s]; ++t) p[size_t(t)] = int32_t(p0[s] + t);
+        ggml_backend_tensor_set(pos_T[s], p.data(), 0, p.size() * sizeof(int32_t));
+        fill_attn_plan_(plan_T[s]);
+
+        if (n_prev[s] == 0) continue;
+        for (size_t li = 0; li < taps[s].size(); ++li) {
+            const auto & LK = st.stages[s].layers[li];
+            ggml_backend_tensor_set(taps[s][li].k_prev, LK.k.data(), 0,
+                                    LK.k.size() * sizeof(float));
+            ggml_backend_tensor_set(taps[s][li].v_prev, LK.v.data(), 0,
+                                    LK.v.size() * sizeof(float));
+        }
+    }
+
+    if (ggml_backend_graph_compute(aux->backend, graph) != GGML_STATUS_SUCCESS) {
+        ggml_free(gctx);
+        throw std::runtime_error("CodecGraphs::stream_push: graph_compute failed");
+    }
+
+    std::vector<float> wav;
+    wav.resize(size_t(n_samples));
+    ggml_backend_tensor_get(waveform, wav.data(), 0, wav.size() * sizeof(float));
+
+    // ── Roll the caches forward ────────────────────────────────────────────
+    std::vector<float> nk, nv;
+    for (size_t s = 0; s < n_stages; ++s) {
+        const int64_t d = m_stages[s].spec.d_model;
+        nk.resize(size_t(d * n_new[s]));
+        nv.resize(size_t(d * n_new[s]));
+        for (size_t li = 0; li < k_new[s].size(); ++li) {
+            ggml_backend_tensor_get(k_new[s][li], nk.data(), 0, nk.size() * sizeof(float));
+            ggml_backend_tensor_get(v_new[s][li], nv.data(), 0, nv.size() * sizeof(float));
+            auto & LK = st.stages[s].layers[li];
+            kv_append_(LK.k, nk, d, keep[s]);
+            kv_append_(LK.v, nv, d, keep[s]);
+        }
+        st.stages[s].n_cached = std::min(keep[s], n_prev[s] + n_new[s]);
+        st.stages[s].next_pos = p0[s] + n_new[s];
+    }
 
     ggml_free(gctx);
     return wav;
@@ -1171,7 +1494,8 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
         pos_T[s] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T_at[s]);
         ggml_set_name(pos_T[s], ("enc_pos_" + std::to_string(s)).c_str());
         ggml_set_input(pos_T[s]);
-        plan_T[s] = make_attn_plan_(gctx, T_at[s], m_enc_stages[s].spec.context);
+        plan_T[s] = make_attn_plan_(gctx, /*q_origin=*/0, T_at[s],
+                                    /*k_origin=*/0, m_enc_stages[s].spec.context);
     }
 
     // Initial patch=240 downsample: (1, T_padded) → (240, T_padded/240)
@@ -1179,7 +1503,7 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
 
     // Encoder stages, each followed by a patch downsample (except the last).
     for (size_t s = 0; s < n_stages; ++s) {
-        x = build_stage_(gctx, x, m_enc_stages[s], pos_T[s], plan_T[s]);
+        x = build_stage_(gctx, x, m_enc_stages[s], pos_T[s], plan_T[s], /*taps=*/nullptr);
         if (m_enc_stages[s].spec.patch_after > 0) {
             x = patch_downsample_(gctx, x, m_enc_stages[s].spec.patch_after);
         }
@@ -1295,6 +1619,38 @@ std::vector<float> codec_decode(Model & model,
     CodecGraphs * cg = model.codec();
     if (!cg) throw std::runtime_error("codec_decode: codec not available on this model");
     return cg->decode(codes, n_vq, t_audio);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// CodecStreamDecoder — a per-utterance handle over CodecGraphs' stream state.
+// The graphs and weights stay shared on the Model; only the K/V lives here, so
+// several streams can run against one loaded codec.
+// ───────────────────────────────────────────────────────────────────────────
+
+struct CodecStreamDecoder::Impl {
+    CodecGraphs *             cg = nullptr;
+    CodecGraphs::StreamState  st;
+    int32_t                   n_vq = 0;
+};
+
+CodecStreamDecoder::CodecStreamDecoder(Model & model, int32_t n_vq)
+    : m_impl(std::make_unique<Impl>()) {
+    m_impl->cg = model.codec();
+    if (!m_impl->cg) {
+        throw std::runtime_error("CodecStreamDecoder: codec not available on this model");
+    }
+    m_impl->n_vq = n_vq;
+    m_impl->cg->stream_reset(m_impl->st, n_vq);
+}
+
+CodecStreamDecoder::~CodecStreamDecoder() = default;
+
+std::vector<float> CodecStreamDecoder::push(const int32_t * codes, int32_t t_audio) {
+    return m_impl->cg->stream_push(m_impl->st, codes, t_audio);
+}
+
+void CodecStreamDecoder::reset() {
+    m_impl->cg->stream_reset(m_impl->st, m_impl->n_vq);
 }
 
 } // namespace openmoss

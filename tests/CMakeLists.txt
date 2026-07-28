@@ -24,3 +24,6 @@ target_link_libraries(moss-prompt-probe PRIVATE openmoss_core)
 
 add_executable(moss-codec-causality ${CMAKE_CURRENT_SOURCE_DIR}/moss_codec_causality.cpp)
 target_link_libraries(moss-codec-causality PRIVATE openmoss_core)
+
+add_executable(moss-codec-stream ${CMAKE_CURRENT_SOURCE_DIR}/moss_codec_stream.cpp)
+target_link_libraries(moss-codec-stream PRIVATE openmoss_core)
