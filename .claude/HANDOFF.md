@@ -257,6 +257,42 @@ frames simultaneously — and all three endpoints now say so rather than ignorin
 the flag. Progress over SSE remains the only thing worth exposing there;
 `generate_sound_effect()` already takes a callback.
 
+## ROCm
+
+Builds and runs on gfx1151 (Strix Halo). The tree needed one fix to compile at
+all under clang — a most-vexing-parse gcc had been resolving the other way — so
+build both compilers before believing a portability claim:
+
+```bash
+export ROCM_PATH=/opt/rocm/core-7.14 HIP_PATH=$ROCM_PATH PATH=$ROCM_PATH/bin:$PATH
+cmake -B build-hip -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151 -DGPU_TARGETS=gfx1151 \
+  -DCMAKE_C_COMPILER=$ROCM_PATH/bin/amdclang -DCMAKE_CXX_COMPILER=$ROCM_PATH/bin/amdclang++
+cmake --build build-hip -j
+```
+
+**ROCm was reported to break MOSS-VoiceGenerator's stop token. It does not.**
+Same model, prompt and seed across all three backends, delay family (the family
+whose stop decision goes through libllama's text logits, so a backend bug would
+show):
+
+| backend | stops at | frames |
+|---|---|---|
+| Vulkan | step 95 | 61 |
+| CPU | step 108 | 74 |
+| ROCm | step 122 | 88 |
+
+All three terminate. CPU — the reference — sits between the two GPU backends, so
+ROCm is not an outlier; the spread is ordinary sampling divergence from small
+numeric differences, which a 2-way stop decision amplifies into a different
+utterance length. Do not read a length difference between backends as a bug.
+
+When a model really does run to `max_new_tokens`, look at the length bound
+before the backend. `generate()` now logs it, and for MOSS-VoiceGenerator it is
+gated on `n_vq < 32` in `finalize_voicegen_request()` — a GGUF that reports 32
+gets no bound at all and will generate minutes of audio from a one-line prompt.
+`GET /info` reports `n_vq`; the converter now refuses to write one that
+disagrees with the checkpoint's audio-head count.
+
 ## What is left
 
 * Continuation mode for `moss_tts_delay` — different slot layout, no verified
