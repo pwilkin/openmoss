@@ -39,6 +39,7 @@ struct Args {
     std::optional<float> temperature, top_p, text_temperature, text_top_p;
     std::optional<float> audio_temperature, audio_top_p, audio_repetition_penalty;
     std::optional<int>   top_k, text_top_k, audio_top_k;
+    std::optional<int>   min_audio_frames, max_audio_frames;
     std::optional<uint64_t> seed;
     std::optional<std::string> dump_codes;
     bool flash_attn = true;
@@ -84,6 +85,13 @@ struct Args {
         "  --audio-top-p F\n"
         "  --audio-top-k N\n"
         "  --audio-repetition-penalty F\n"
+        "  --min-audio-frames N   Forbid end-of-speech before N frames (0 = no floor)\n"
+        "  --max-audio-frames N   Force end-of-speech at N frames (0 = no cap). One\n"
+        "                         frame is 80 ms. This is the bound to reach for when a\n"
+        "                         model will not emit end-of-speech and generates until\n"
+        "                         --max-new-tokens: it caps the damage without needing\n"
+        "                         to know why. MOSS-VoiceGenerator is the usual case —\n"
+        "                         it has no reference audio to anchor its length.\n"
         "  --seed N               Non-negative; omit for a random per-run seed\n"
         "  --dump-codes PATH      Write the generated (n_vq, T) code matrix as text\n"
         "  --n-batch N            libllama batch size (default: 512). Raise if a\n"
@@ -182,6 +190,8 @@ int main(int argc, char ** argv) {
         else if (k == "--audio-top-k")       a.audio_top_k       = require_int(i, argc, argv);
         else if (k == "--audio-repetition-penalty")
                                              a.audio_repetition_penalty = require_float(i, argc, argv);
+        else if (k == "--min-audio-frames")  a.min_audio_frames  = require_int(i, argc, argv);
+        else if (k == "--max-audio-frames")  a.max_audio_frames  = require_int(i, argc, argv);
         else if (k == "--seed")              a.seed              = uint64_t(std::strtoull(require_str(i, argc, argv).c_str(), nullptr, 10));
         else if (k == "--dump-codes")        a.dump_codes        = require_str(i, argc, argv);
         else if (k == "--n-gpu-layers")    a.n_gpu_layers = require_int(i, argc, argv);
@@ -311,6 +321,8 @@ int main(int argc, char ** argv) {
     if (a.audio_top_k)       req.sampling.audio_top_k       = *a.audio_top_k;
     if (a.audio_repetition_penalty)
         req.sampling.audio_repetition_penalty = *a.audio_repetition_penalty;
+    if (a.min_audio_frames) req.sampling.min_audio_frames = *a.min_audio_frames;
+    if (a.max_audio_frames) req.sampling.max_audio_frames = *a.max_audio_frames;
     if (a.seed) req.sampling.seed = *a.seed;
 
     req.text          = a.text;

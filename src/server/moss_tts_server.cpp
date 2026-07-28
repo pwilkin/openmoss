@@ -248,6 +248,13 @@ openmoss::SamplingConfig parse_sampling(const json & j, const openmoss::Sampling
     sc.audio_top_k             = jget(j, "audio_top_k",             sc.audio_top_k);
     sc.audio_repetition_penalty = jget(j, "audio_repetition_penalty", sc.audio_repetition_penalty);
     sc.seed                    = jget(j, "seed",                    sc.seed);
+    // The hard bounds on segment length. finalize_voicegen_request() derives
+    // these for MOSS-VoiceGenerator when the caller gives no duration hint, but
+    // only fills a zero — so an explicit value here wins. Worth reaching for
+    // when a model will not emit end-of-speech: it caps the damage without
+    // needing to know why.
+    sc.min_audio_frames        = jget(j, "min_audio_frames",        sc.min_audio_frames);
+    sc.max_audio_frames        = jget(j, "max_audio_frames",        sc.max_audio_frames);
     return sc;
 }
 
