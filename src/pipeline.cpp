@@ -570,6 +570,16 @@ GenerateResult generate(Model & model,
     std::fprintf(stderr, "[generate] prefill done in %.2fs\n", result.prefill_seconds);
 
     // ── 3. Autoregressive loop ─────────────────────────────────────────────
+    //
+    // Log the effective length bounds before generating. When a model fails to
+    // emit end-of-speech and runs to max_new_tokens, the first question is
+    // whether a cap was in force at all — and for MOSS-VoiceGenerator that is
+    // decided upstream of here, by whether the caller's model reports n_vq < 32.
+    // Printing it makes the answer a log line rather than a code read.
+    std::fprintf(stderr,
+                 "[generate] frame bounds: min=%d max=%d (0 = unbounded), max_new_tokens=%d\n",
+                 req.sampling.min_audio_frames, req.sampling.max_audio_frames,
+                 req.max_new_tokens);
     auto t_gen = clock_t_::now();
     int32_t pos = prompt_len;
     int32_t step = 0;

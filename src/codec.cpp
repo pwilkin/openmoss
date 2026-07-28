@@ -1388,7 +1388,11 @@ std::vector<float> CodecGraphs::stream_push(StreamState & st,
         // RoPE positions are global — a chunk starting at frame 400 must see the
         // same rotations the batch decode gave frame 400, or the cached keys it
         // attends over are in a different frame of reference than its queries.
-        std::vector<int32_t> p(size_t(n_new[s]));
+        // Not `p(size_t(n_new[s]))`: clang reads that as a function declaration
+        // taking `size_t n_new[s]` and rejects the uses below, while gcc accepts
+        // it. Assign the size instead of parenthesising it.
+        std::vector<int32_t> p;
+        p.resize(size_t(n_new[s]));
         for (int64_t t = 0; t < n_new[s]; ++t) p[size_t(t)] = int32_t(p0[s] + t);
         ggml_backend_tensor_set(pos_T[s], p.data(), 0, p.size() * sizeof(int32_t));
         fill_attn_plan_(plan_T[s]);
