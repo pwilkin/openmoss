@@ -33,6 +33,13 @@ enum class Arch {
                   // "backbone" is a plain Qwen3-1.7B used only as a text encoder.
 };
 
+// Out-of-line deleters for the MOSS-SoundEffect graphs Model caches below.
+// Model's destructor is compiled where those types are incomplete — they live in
+// soundeffect.h, which includes *this* header — so the deleters are declared
+// here and defined next to each class. Same reason DiTContext has one.
+struct DiTGraphDeleter   { void operator()(class DiTGraph *)   const; };
+struct DacDecoderDeleter { void operator()(class DacDecoder *) const; };
+
 const char * arch_name(Arch a);
 bool         arch_from_name(const std::string & name, Arch & out);
 
@@ -199,6 +206,13 @@ public:
     // Codec graph wrapper (lazy-instantiated on first use).
     class CodecGraphs * codec();
 
+    // MOSS-SoundEffect graphs, lazy-instantiated and then cached for the
+    // model's lifetime. Caching matters more here than it looks: constructing a
+    // DacDecoder materialises ~300 MB of f32 convolution kernels on the backend,
+    // which a server would otherwise redo on every request.
+    class DiTGraph   * dit();
+    class DacDecoder * dac_decoder();
+
     // Tokenizer wrapper (BPE, exposed via libllama's vocab API).
     class Tokenizer * tokenizer() const { return m_tokenizer.get(); }
 
@@ -222,6 +236,8 @@ private:
     std::unique_ptr<Aux>                m_aux;
     std::unique_ptr<class Tokenizer>    m_tokenizer;
     std::unique_ptr<class CodecGraphs>  m_codec;
+    std::unique_ptr<class DiTGraph,   DiTGraphDeleter>   m_dit;
+    std::unique_ptr<class DacDecoder, DacDecoderDeleter> m_dac;
 };
 
 } // namespace openmoss

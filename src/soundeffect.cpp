@@ -29,6 +29,7 @@
 #include "openmoss/model.h"
 #include "openmoss/tokenizer.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -209,7 +210,7 @@ SoundEffectResult generate_sound_effect(Model & model,
     const int64_t C         = d.dit_in_dim;
     res.n_latents = int32_t(n_latents);
 
-    DiTGraph dit(model);
+    DiTGraph & dit = *model.dit();
 
     // ── 1. Text conditioning ───────────────────────────────────────────────
     auto t0 = clock_t_::now();
@@ -277,12 +278,24 @@ SoundEffectResult generate_sound_effect(Model & model,
     res.latent = latent;
 
     // ── 3. Decode and crop ─────────────────────────────────────────────────
+    //
+    // The DiT always denoises the full `max_seconds`, but the VAE does not have
+    // to decode all of it. The decoder is a convolution stack with a measured
+    // half-receptive field of at most 12 latent frames, so samples before
+    // `n_keep * hop` are unaffected by anything past `n_keep + margin` — and the
+    // waveform beyond the requested duration is discarded anyway. At the default
+    // 10 s of a 30 s ceiling that is two thirds of the decode skipped; the margin
+    // is what keeps the retained region bit-identical to a full decode.
+    const size_t want = size_t(double(d.sampling_rate) * double(seconds));
+    const int64_t margin = 32;                     // >2x the measured 12
+    const int64_t n_keep = std::min<int64_t>(
+        n_latents,
+        int64_t((want + size_t(d.vae_hop) - 1) / size_t(d.vae_hop)) + margin);
+
     t0 = clock_t_::now();
-    DacDecoder vae(model);
-    res.waveform = vae.decode(latent.data(), n_latents);
+    res.waveform = model.dac_decoder()->decode(latent.data(), n_keep);
     res.decode_seconds = seconds_t(clock_t_::now() - t0).count();
 
-    const size_t want = size_t(double(d.sampling_rate) * double(seconds));
     if (res.waveform.size() > want) res.waveform.resize(want);
 
     return res;

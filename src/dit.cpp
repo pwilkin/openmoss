@@ -675,4 +675,18 @@ void DiTGraph::forward(const float *      latent,
     ggml_free(gctx);
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Lazy accessors on Model
+//
+// Defined here rather than in model.cpp so the unique_ptr destructors see the
+// complete types — the same reason Model::codec() lives in codec.cpp.
+// ───────────────────────────────────────────────────────────────────────────
+
+DiTGraph * Model::dit() {
+    if (!m_dit) m_dit.reset(new DiTGraph(*this));
+    return m_dit.get();
+}
+
+void DiTGraphDeleter::operator()(DiTGraph * p) const { delete p; }
+
 } // namespace openmoss

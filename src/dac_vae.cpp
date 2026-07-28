@@ -478,4 +478,11 @@ std::vector<float> DacDecoder::decode(const float * latent, int64_t n_frames,
     return wav;
 }
 
+DacDecoder * Model::dac_decoder() {
+    if (!m_dac) m_dac.reset(new DacDecoder(*this));
+    return m_dac.get();
+}
+
+void DacDecoderDeleter::operator()(DacDecoder * p) const { delete p; }
+
 } // namespace openmoss
