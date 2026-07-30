@@ -29,7 +29,7 @@ struct Args {
     // In-house: one reference WAV per speaker ([S1], [S2], ...) and the prompt
     // template that goes with the loaded checkpoint (delay family only).
     std::vector<std::string>   speaker_refs;
-    std::string                template_name = "ttsd";
+    std::string                template_name = "auto";
     bool                       no_prefix = false;
     std::optional<std::string> instruction;
     std::optional<std::string> language;
@@ -79,11 +79,16 @@ struct Args {
         "                         Enables multi-speaker cloning with an assistant-side\n"
         "                         continuation prefix (delay family only).\n"
         "  --template NAME        Prompt template + sampling defaults for the delay\n"
-        "                         family: ttsd (default) or voicegen. TTSD's template\n"
-        "                         has \"- Scene:\" and pins \"- Tokens:\" to None;\n"
-        "                         VoiceGenerator's is the reverse. Defaults:\n"
+        "                         family: auto (default), ttsd or voicegen. TTSD's\n"
+        "                         template has \"- Scene:\" and pins \"- Tokens:\" to\n"
+        "                         None; VoiceGenerator's is the reverse. Defaults:\n"
         "                         ttsd 1.1/0.9/50/1.1 (its generation_config.json),\n"
-        "                         voicegen 1.5/0.6/50/1.1 (its model card).\n"
+        "                         voicegen 1.5/0.6/50/1.1 (its model card). auto\n"
+        "                         derives from the model: n_vq>=32 is the flagship\n"
+        "                         MOSS-TTS (own layout and defaults); the two n_vq=16\n"
+        "                         checkpoints are indistinguishable from the GGUF, so\n"
+        "                         auto assumes voicegen and says so — pass\n"
+        "                         --template ttsd when running MOSS-TTSD.\n"
         "  --no-continuation-prefix\n"
         "                         Do not splice the reference audio behind the\n"
         "                         assistant's audio_start. The model then re-speaks\n"
@@ -248,8 +253,9 @@ int main(int argc, char ** argv) {
         else { std::fprintf(stderr, "unknown arg: %s\n", k.c_str()); usage(2); }
     }
     if (a.model_path.empty() || a.text.empty()) usage(2);
-    if (a.template_name != "ttsd" && a.template_name != "voicegen") {
-        std::fprintf(stderr, "unknown --template: %s (expected ttsd or voicegen)\n",
+    if (a.template_name != "auto" && a.template_name != "ttsd" &&
+        a.template_name != "voicegen") {
+        std::fprintf(stderr, "unknown --template: %s (expected auto, ttsd or voicegen)\n",
                      a.template_name.c_str());
         usage(2);
     }
@@ -337,25 +343,47 @@ int main(int argc, char ** argv) {
     // defaults selected by --template, then the broad --temperature/--top-p/
     // --top-k aliases, then the per-channel flags, which win.
     req.sampling = openmoss::default_sampling(model->dims().arch);
-    const bool is_ttsd = (a.template_name == "ttsd");
+    // Resolve --template auto from the model itself: n_vq>=32 is the flagship
+    // MOSS-TTS, which keeps its own prompt layout and the family struct
+    // defaults. The two reduced-codebook checkpoints (MOSS-TTSD and
+    // MOSS-VoiceGenerator, both n_vq=16) are indistinguishable from the GGUF —
+    // same arch, same n_vq, and this converter stamps general.name
+    // "Qwen3_Backbone" for both — so assume voicegen, matching the server's
+    // historical guess, and say so.
+    std::string tpl = a.template_name;
     if (model->dims().arch == openmoss::Arch::TTSDelay) {
-        req.prompt_template = is_ttsd ? openmoss::PromptTemplate::TTSD
-                                      : openmoss::PromptTemplate::VoiceGen;
+        if (tpl == "auto") {
+            if (model->dims().n_vq >= 32) {
+                tpl = "moss-tts";
+            } else {
+                tpl = "voicegen";
+                std::fprintf(stderr,
+                    "[cli] --template auto: n_vq=%d cannot distinguish MOSS-TTSD from "
+                    "MOSS-VoiceGenerator; assuming voicegen — pass --template ttsd "
+                    "when running MOSS-TTSD\n",
+                    model->dims().n_vq);
+            }
+        }
         // default_sampling() carries the flagship MOSS-TTS-Delay values, which
-        // suit neither checkpoint here. TTSD ships generation_config.json with
-        // 1.1/0.9/50/1.1; VoiceGenerator documents 1.5/0.6/50/1.1 in
+        // suit neither reduced checkpoint. TTSD ships generation_config.json
+        // with 1.1/0.9/50/1.1; VoiceGenerator documents 1.5/0.6/50/1.1 in
         // modeling_moss_tts.py:401-404 and its model card, with the warning
         // that it is sensitive to these.
-        if (is_ttsd) {
+        if (tpl == "ttsd") {
+            req.prompt_template = openmoss::PromptTemplate::TTSD;
             req.sampling.audio_temperature        = 1.1f;
             req.sampling.audio_top_p              = 0.9f;
             req.sampling.audio_top_k              = 50;
             req.sampling.audio_repetition_penalty = 1.1f;
-        } else {
+        } else if (tpl == "voicegen") {
+            req.prompt_template = openmoss::PromptTemplate::VoiceGen;
             req.sampling.audio_temperature        = 1.5f;
             req.sampling.audio_top_p              = 0.6f;
             req.sampling.audio_top_k              = 50;
             req.sampling.audio_repetition_penalty = 1.1f;
+        } else {
+            // Flagship MOSS-TTS: VoiceGen prompt layout, struct defaults stand.
+            req.prompt_template = openmoss::PromptTemplate::VoiceGen;
         }
     }
     if (a.temperature) { req.sampling.text_temperature = *a.temperature;
@@ -408,7 +436,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr,
                      "[cli] template=%s sampling: temp=%.2f top_p=%.2f top_k=%d rep_pen=%.2f "
                      "frames=[%d,%d]\n",
-                     a.template_name.c_str(),
+                     tpl.c_str(),
                      req.sampling.audio_temperature,
                      req.sampling.audio_top_p,
                      req.sampling.audio_top_k,
