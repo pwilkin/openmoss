@@ -92,6 +92,11 @@ DelayState::DelayState(const ModelDims & dims,
                     break;
                 }
             }
+            // Everything already in the segment came from the prompt (our
+            // continuation prefix), not from the model. Remember it so the
+            // min/max_audio_frames bounds apply to generated frames only —
+            // otherwise a 62-frame prefix instantly trips a cap of 30.
+            m_audio_prefix = m_audio_length;
         }
     }
 }
@@ -130,7 +135,7 @@ DelayStep DelayState::step(const float * text_logits,
         next_text = m_dims.audio_end_token_id;
         m_is_audio = false;
     } else if (m_is_audio && m_delayed_length < 0 && sc.max_audio_frames > 0 &&
-               m_audio_length >= int64_t(sc.max_audio_frames)) {
+               m_audio_length - m_audio_prefix >= int64_t(sc.max_audio_frames)) {
         // Hit the length cap — force the end-of-segment flush so the model can't
         // ramble far past the requested length.
         next_text = m_dims.audio_assistant_delay_slot_token_id;
@@ -169,7 +174,7 @@ DelayStep DelayState::step(const float * text_logits,
         // it on the first audio frame, collapsing the segment to T≈n_vq — which
         // extract_audio_codes discards as empty (the degenerate immediate EOS).
         if (m_is_audio && m_delayed_length < 0 &&
-            m_audio_length < int64_t(sc.min_audio_frames)) {
+            m_audio_length - m_audio_prefix < int64_t(sc.min_audio_frames)) {
             mask(m_dims.audio_assistant_delay_slot_token_id);
         }
 
@@ -230,6 +235,7 @@ DelayStep DelayState::step(const float * text_logits,
     }
     if (next_text == m_dims.audio_end_token_id) {
         m_audio_length = 0;
+        m_audio_prefix = 0;   // later segments carry no prompt prefix
     }
 
     // delayed_length convention here differs from the reference by one (the

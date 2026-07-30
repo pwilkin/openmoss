@@ -16,6 +16,14 @@
 
 namespace openmoss {
 
+// In-house: which <user_inst> template to emit for the delay family. The two
+// checkpoints ship *different* processors: MOSS-TTSD hard-codes "- Tokens:\nNone"
+// and carries an extra "- Scene:" field (its processing_moss_tts.py:79-80, 89-90,
+// 117); MOSS-VoiceGenerator has a real {tokens} placeholder and no Scene field
+// (its processing_moss_tts.py:141-142). VoiceGen is the default and matches the
+// prompt layout upstream's moss-prompt-probe validates.
+enum class PromptTemplate { VoiceGen, TTSD };
+
 struct GenerateRequest {
     std::string text;
     // Channel-interleaved f32 at the model's sampling rate / channel count.
@@ -28,6 +36,26 @@ struct GenerateRequest {
     // "said" the reference, so it carries on into the new material.
     // MOSS-TTS-Local only.
     std::optional<std::string>        ref_text;
+
+    // ── In-house additions for the delay family (multi-speaker cloning) ────
+    // Per-speaker reference wavs: each gets its own [S{i}] block in the user
+    // turn, mirroring MossTTSDelayProcessor's reference list handling
+    // (processing_moss_tts.py:98-106). When set, `reference_wav` must hold the
+    // concatenation of all speakers — that is what feeds the assistant-side
+    // continuation prefix.
+    std::vector<std::vector<float>>   reference_wavs;
+    PromptTemplate                    prompt_template = PromptTemplate::VoiceGen;
+    // Assistant-side continuation prefix: encode `reference_wav` and place it
+    // behind the assistant's audio_start as gen_slot rows (upstream's
+    // mode="continuation" + truncation=True), so the model does not re-speak
+    // the references and the delay ramp lands inside the prefix. The prefix
+    // audio is trimmed from the output waveform. Delay family only — this is
+    // the in-house feature upstream's STATUS.md lists as "not done".
+    bool                              continuation_prefix = true;
+    // Loudness-normalize each reference to −20 dBFS before encoding, as
+    // upstream's processor does (processing_moss_tts.py:767-779).
+    bool                              normalize_reference = true;
+
     std::optional<std::string>        instruction;     // e.g. voice description
     std::optional<std::string>        language;        // "en", "zh", ...
     std::optional<std::string>        quality;         // upstream "quality" hint

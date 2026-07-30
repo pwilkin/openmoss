@@ -52,6 +52,11 @@ private:
     bool            m_is_audio       = false;
     bool            m_is_stopping    = false;
     int64_t         m_audio_length   = 0;
+    // Audio frames already present in the prompt when this segment opened — the
+    // assistant-side continuation prefix. min/max_audio_frames bound what the
+    // model *generates*, so they are measured against m_audio_length minus this.
+    // Reset to 0 whenever a segment closes, since later segments have no prefix.
+    int64_t         m_audio_prefix   = 0;
     int64_t         m_delayed_length = -1;     // -1 sentinel ≈ INT64_MAX
     std::vector<std::vector<int32_t>> m_history; // (T, 1+n_vq)
     std::unique_ptr<Rng> m_rng;                  // seeded lazily on first step()

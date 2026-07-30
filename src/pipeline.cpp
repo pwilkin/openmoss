@@ -13,9 +13,19 @@
 //          run audio LM heads, run DelayState, embed the next row, decode
 //       5) once DelayState reports stopping, extract audio codes
 //
-// Not wired up: continuation mode for the delay family. Its slot layout differs
-// and it has no verified reference here, so GenerateRequest::ref_text is
+// Not wired up upstream: continuation mode for the delay family — ref_text is
 // rejected for that architecture rather than silently ignored.
+//
+// In-house additions for the delay family (multi-speaker voice cloning):
+//   - loudness_normalize() on references (processing_moss_tts.py:767-779)
+//   - per-speaker [S{i}] reference blocks in the user turn (:98-106)
+//   - assistant-side continuation prefix: the concatenated reference audio goes
+//     behind the assistant's audio_start as gen_slot rows with no audio_end
+//     (upstream python mode="continuation" + truncation=True, :650-653), so the
+//     model does not re-speak the references; the prefix is trimmed from the
+//     output waveform (:721-738)
+//   - PromptTemplate::TTSD: MOSS-TTSD's processor hard-codes "- Tokens:\nNone"
+//     and carries an extra "- Scene:" field; VoiceGenerator's does neither.
 
 #include "openmoss/pipeline.h"
 #include "openmoss/codec.h"
@@ -25,6 +35,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -54,6 +65,34 @@ std::string id_to_token(const Tokenizer & tok, int32_t id) {
     return tok.decode({id});
 }
 
+// Upstream loudness-normalizes every reference before encoding it
+// (processing_moss_tts.py:767-779): RMS toward −20 dBFS, gain clamped to ±3 dB.
+void loudness_normalize(std::vector<float> & wav, float target_dbfs = -20.0f) {
+    if (wav.empty()) return;
+    double sum = 0.0;
+    for (float v : wav) sum += double(v) * double(v);
+    const double cur_db = 10.0 * std::log10(sum / double(wav.size()) + 1e-9);
+    double gain = double(target_dbfs) - cur_db;
+    if (gain < -3.0) gain = -3.0;
+    if (gain >  3.0) gain =  3.0;
+    const float factor = float(std::pow(10.0, gain / 20.0));
+    for (float & v : wav) v *= factor;
+}
+
+// Assistant-side continuation prefix: <audio_start><gen_slot> x T_prefix and
+// NOTHING else — no delay slots, no audio_end. Upstream builds
+// audio_start + gen*T + delay*(n_vq-1) + end and then cuts it back to exactly T
+// rows with truncation=True (processing_moss_tts.py:465-473 + 650-653), so the
+// prompt deliberately ends mid-utterance and the model continues from there.
+std::string build_assistant_prefix_block(const Tokenizer & tok,
+                                          const ModelDims & d,
+                                          int32_t T_prefix) {
+    std::string s = id_to_token(tok, d.audio_start_token_id);
+    const std::string gen_slot = id_to_token(tok, d.audio_assistant_gen_slot_token_id);
+    for (int32_t t = 0; t < T_prefix; ++t) s += gen_slot;
+    return s;
+}
+
 // Build a literal token-string form of the reference-audio block:
 //   <audio_start><user_slot>…<delay_slot>…<audio_end>
 // — exactly what `_replace_audio_placeholders` produces upstream when the
@@ -74,39 +113,58 @@ std::string build_reference_audio_block(const Tokenizer & tok,
 }
 
 // Build the user-instruction body that wraps the synthesis target.
-//   reference_block: literal token string for the encoded reference audio,
-//                    or empty when no reference is supplied.
+//   reference_blocks: one literal token string per speaker, in [S1], [S2], ...
+//                     order (processing_moss_tts.py:98-106); empty when no
+//                     reference is supplied. Without separate blocks the model
+//                     takes all reference audio to be speaker 1 and invents a
+//                     voice for [S2].
 std::string build_user_inst(const GenerateRequest & req,
-                             const std::string & reference_block) {
+                             const std::vector<std::string> & reference_blocks) {
+    const bool ttsd = (req.prompt_template == PromptTemplate::TTSD);
     std::string s;
     s += "<user_inst>\n";
     s += "- Reference(s):\n";
-    if (reference_block.empty()) s += "None\n";
-    else                          s += "[S1]:\n" + reference_block + "\n";
+    if (reference_blocks.empty()) {
+        s += "None\n";
+    } else {
+        for (size_t i = 0; i < reference_blocks.size(); ++i) {
+            s += "[S" + std::to_string(i + 1) + "]:\n" + reference_blocks[i] + "\n";
+        }
+    }
     s += "- Instruction:\n" + default_or_none(req.instruction) + "\n";
-    s += "- Tokens:\n"      + default_or_none(req.tokens)      + "\n";
+    // MOSS-TTSD hard-codes "- Tokens:" to None (its processing_moss_tts.py:79-80 —
+    // the template holds the literal string "None", not a placeholder). Only
+    // MOSS-VoiceGenerator has a real {tokens} placeholder there (VG :141-142).
+    s += "- Tokens:\n"      + (ttsd ? std::string("None")
+                                    : default_or_none(req.tokens)) + "\n";
     s += "- Quality:\n"     + default_or_none(req.quality)     + "\n";
     s += "- Sound Event:\nNone\n";
     s += "- Ambient Sound:\nNone\n";
     s += "- Language:\n"    + default_or_none(req.language)    + "\n";
+    // TTSD's template carries an extra "- Scene:" field between Language and
+    // Text (TTSD :89-90), which upstream ALWAYS fills with "None" (:117).
+    // VoiceGenerator has no such field.
+    if (ttsd) s += "- Scene:\nNone\n";
     s += "- Text:\n"        + req.text                         + "\n";
     s += "</user_inst>";
     return s;
 }
 
 // Build the full assistant-prompt string:
-//   <im_start>user\n…<im_end>\n<im_start>assistant\n<audio_start>
+//   <im_start>user\n…<im_end>\n<im_start>assistant\n<audio_start><gen_slot>*T
+// The trailing gen_slots (T_prefix > 0) are the assistant-side continuation
+// prefix; T_prefix = 0 degrades to upstream's plain audio_start ending.
 std::string build_prompt_text(const Tokenizer & tok, const ModelDims & d,
                                const GenerateRequest & req,
-                               const std::string & reference_block) {
+                               const std::vector<std::string> & reference_blocks,
+                               int32_t T_prefix = 0) {
     const std::string im_start    = id_to_token(tok, d.im_start_token_id);
     const std::string im_end      = id_to_token(tok, d.im_end_token_id);
-    const std::string audio_start = id_to_token(tok, d.audio_start_token_id);
 
-    std::string body = build_user_inst(req, reference_block);
+    std::string body = build_user_inst(req, reference_blocks);
     std::string out;
     out += im_start + "user\n" + body + im_end + "\n"
-         + im_start + "assistant\n" + audio_start;
+         + im_start + "assistant\n" + build_assistant_prefix_block(tok, d, T_prefix);
     return out;
 }
 
@@ -130,15 +188,18 @@ std::vector<int32_t> apply_delay_pattern(const int32_t * codes,
 
 // Build the (S, 1+n_vq) prompt grid: text ids in column 0, audio_pad_code
 // elsewhere — except for the reference-audio rows where we splice in the
-// delay-pattern-shifted codes from the encoded reference.
+// delay-pattern-shifted codes from the encoded reference(s), and (in-house) the
+// assistant-side continuation prefix behind the unpaired trailing audio_start.
 std::vector<int32_t> build_prompt_grid(const Tokenizer & tok,
                                        const ModelDims & d,
                                        const GenerateRequest & req,
-                                       const std::string & reference_block,
-                                       const std::vector<int32_t> * ref_codes,
-                                       int32_t T_ref,
+                                       const std::vector<std::string> & reference_blocks,
+                                       const std::vector<std::vector<int32_t>> * ref_codes_vec,
+                                       const std::vector<int32_t> * ref_T_vec,
+                                       const std::vector<int32_t> * prefix_codes,
+                                       int32_t T_prefix,
                                        int32_t & n_pos_out) {
-    const std::string prompt = build_prompt_text(tok, d, req, reference_block);
+    const std::string prompt = build_prompt_text(tok, d, req, reference_blocks, T_prefix);
     auto ids = tok.encode(prompt, /*add_special=*/false);
     n_pos_out = int32_t(ids.size());
     const int32_t cols = 1 + d.n_vq;
@@ -148,37 +209,66 @@ std::vector<int32_t> build_prompt_grid(const Tokenizer & tok,
         grid[size_t(r) * size_t(cols) + 0] = ids[r];
     }
 
-    if (!ref_codes || T_ref <= 0) return grid;
+    const bool has_ref    = (ref_codes_vec && !ref_codes_vec->empty());
+    const bool has_prefix = (prefix_codes && T_prefix > 0);
+    if (!has_ref && !has_prefix) return grid;
 
-    // Locate the (single) audio_start / audio_end pair that bounds the user
-    // reference. The trailing audio_start the assistant turn ends with does
-    // NOT have a matching audio_end and is therefore skipped naturally.
-    int32_t a_start = -1, a_end = -1;
-    for (int32_t r = 0; r < n_pos_out; ++r) {
-        if (a_start < 0 && ids[r] == d.audio_start_token_id) {
-            a_start = r;
-        } else if (a_start >= 0 && ids[r] == d.audio_end_token_id) {
-            a_end = r;
-            break;
+    if (has_ref) {
+        // Collect every audio_start/audio_end pair (one per speaker). The LAST
+        // audio_start is unpaired — that is the assistant turn, not a reference.
+        std::vector<int32_t> starts, ends;
+        for (int32_t r = 0; r < n_pos_out; ++r) {
+            if      (ids[r] == d.audio_start_token_id) starts.push_back(r);
+            else if (ids[r] == d.audio_end_token_id)   ends.push_back(r);
+        }
+        if (ends.size() != ref_codes_vec->size()) {
+            throw std::runtime_error("build_prompt_grid: " + std::to_string(ends.size()) +
+                " reference blocks in prompt but " + std::to_string(ref_codes_vec->size()) + " encoded");
+        }
+        for (size_t b = 0; b < ends.size(); ++b) {
+            const int32_t a_start = starts[b];
+            const int32_t a_end   = ends[b];
+            const int32_t T_b     = (*ref_T_vec)[b];
+            const int32_t span    = a_end - a_start - 1;   // tokens strictly between markers
+            const int32_t expect  = T_b + d.n_vq - 1;
+            if (span != expect) {
+                throw std::runtime_error("build_prompt_grid: span mismatch for block " + std::to_string(b) +
+                    " (got " + std::to_string(span) + ", expected " + std::to_string(expect) + ")");
+            }
+            const auto delayed = apply_delay_pattern((*ref_codes_vec)[b].data(), d.n_vq, T_b, d.audio_pad_code);
+            for (int32_t k = 0; k < span; ++k) {
+                const int32_t r = a_start + 1 + k;
+                for (int32_t i = 0; i < d.n_vq; ++i) {
+                    grid[size_t(r) * size_t(cols) + 1 + i] = delayed[size_t(k) * size_t(d.n_vq) + size_t(i)];
+                }
+            }
         }
     }
-    if (a_start < 0 || a_end < 0) {
-        throw std::runtime_error("build_prompt_grid: reference audio markers not found in tokenized prompt");
-    }
 
-    const int32_t span = a_end - a_start - 1;        // tokens strictly between markers
-    const int32_t expected = T_ref + d.n_vq - 1;
-    if (span != expected) {
-        throw std::runtime_error("build_prompt_grid: reference audio span mismatch (got " +
-                                  std::to_string(span) + ", expected " + std::to_string(expected) + ")");
-    }
-
-    const auto delayed = apply_delay_pattern(ref_codes->data(), d.n_vq, T_ref, d.audio_pad_code);
-    for (int32_t k = 0; k < span; ++k) {
-        const int32_t r = a_start + 1 + k;
-        for (int32_t i = 0; i < d.n_vq; ++i) {
-            grid[size_t(r) * size_t(cols) + 1 + i] =
-                delayed[size_t(k) * size_t(d.n_vq) + size_t(i)];
+    // Assistant-side continuation prefix: the LAST audio_start is unpaired (the
+    // assistant turn). Exactly T_prefix gen_slots follow it; splice the first
+    // T_prefix rows of the delay pattern into those positions (upstream python
+    // truncation, processing_moss_tts.py:650-653).
+    if (has_prefix) {
+        int32_t p_start = -1;
+        for (int32_t r = n_pos_out - 1; r >= 0; --r) {
+            if (ids[r] == d.audio_start_token_id) { p_start = r; break; }
+        }
+        if (p_start < 0) {
+            throw std::runtime_error("build_prompt_grid: assistant audio_start not found");
+        }
+        const int32_t p_span = n_pos_out - p_start - 1;
+        if (p_span != T_prefix) {
+            throw std::runtime_error("build_prompt_grid: assistant prefix span mismatch (got " +
+                                      std::to_string(p_span) + ", expected " + std::to_string(T_prefix) + ")");
+        }
+        const auto pdel = apply_delay_pattern(prefix_codes->data(), d.n_vq, T_prefix, d.audio_pad_code);
+        for (int32_t k = 0; k < p_span; ++k) {
+            const int32_t r = p_start + 1 + k;
+            for (int32_t i = 0; i < d.n_vq; ++i) {
+                grid[size_t(r) * size_t(cols) + 1 + i] =
+                    pdel[size_t(k) * size_t(d.n_vq) + size_t(i)];
+            }
         }
     }
     return grid;
@@ -379,9 +469,21 @@ std::vector<int32_t> debug_build_prompt_grid(Model & model,
         case Arch::TTSLocal:
             return build_prompt_grid_local(*tok, d, req, ref_codes, T_ref, n_pos_out);
         case Arch::TTSDelay: {
-            std::string block;
-            if (ref_codes && T_ref > 0) block = build_reference_audio_block(*tok, d, T_ref);
-            return build_prompt_grid(*tok, d, req, block, ref_codes, T_ref, n_pos_out);
+            // Probe seam: single reference, no continuation prefix. With one
+            // block and PromptTemplate::VoiceGen this is byte-identical to the
+            // layout the reference processor produces (and the probe validates).
+            std::vector<std::string>          blocks;
+            std::vector<std::vector<int32_t>> codes_vec;
+            std::vector<int32_t>              T_vec;
+            if (ref_codes && T_ref > 0) {
+                blocks.push_back(build_reference_audio_block(*tok, d, T_ref));
+                codes_vec.push_back(*ref_codes);
+                T_vec.push_back(T_ref);
+            }
+            return build_prompt_grid(*tok, d, req, blocks,
+                                     codes_vec.empty() ? nullptr : &codes_vec, &T_vec,
+                                     /*prefix_codes=*/nullptr, /*T_prefix=*/0,
+                                     n_pos_out);
         }
         case Arch::SoundEffect:
             break;
@@ -405,15 +507,23 @@ GenerateResult generate(Model & model,
     std::vector<int32_t> ref_codes;
     int32_t T_ref = 0;
     std::string reference_block;
+    // In-house (delay family): per-speaker reference blocks + assistant prefix.
+    std::vector<std::vector<int32_t>> ref_codes_vec;
+    std::vector<int32_t>              ref_T_vec;
+    std::vector<std::string>          reference_blocks;
+    std::vector<int32_t>              prefix_codes;
+    int32_t                           T_prefix = 0;
     if (req.reference_wav && !req.reference_wav->empty()) {
         if (!model.codec_loaded())
             throw std::runtime_error("generate: reference_wav supplied but codec is not loaded");
 
         auto t_enc = clock_t_::now();
         int32_t nvq_enc = 0;
+        std::vector<float> main_ref = *req.reference_wav;
+        if (d.arch == Arch::TTSDelay && req.normalize_reference) loudness_normalize(main_ref);
         ref_codes = codec_encode(model,
-                                  req.reference_wav->data(),
-                                  int64_t(req.reference_wav->size()),
+                                  main_ref.data(),
+                                  int64_t(main_ref.size()),
                                   nvq_enc, T_ref);
         if (nvq_enc != n_vq) {
             throw std::runtime_error("generate: codec_encode returned n_vq=" +
@@ -425,6 +535,39 @@ GenerateResult generate(Model & model,
                      seconds_t(clock_t_::now() - t_enc).count());
         if (d.arch == Arch::TTSDelay) {
             reference_block = build_reference_audio_block(*tok, d, T_ref);
+
+            // Per-speaker wavs, when supplied, each get their own [S{i}] block;
+            // otherwise the single reference becomes block [S1].
+            if (!req.reference_wavs.empty()) {
+                for (size_t i = 0; i < req.reference_wavs.size(); ++i) {
+                    std::vector<float> w = req.reference_wavs[i];
+                    if (req.normalize_reference) loudness_normalize(w);
+                    int32_t nvq_i = 0, T_i = 0;
+                    auto c = codec_encode(model, w.data(), int64_t(w.size()), nvq_i, T_i);
+                    if (nvq_i != n_vq) {
+                        throw std::runtime_error("generate: codec_encode returned n_vq=" +
+                                                  std::to_string(nvq_i) + " for speaker " +
+                                                  std::to_string(i + 1) + ", expected " + std::to_string(n_vq));
+                    }
+                    ref_codes_vec.push_back(std::move(c));
+                    ref_T_vec.push_back(T_i);
+                    reference_blocks.push_back(build_reference_audio_block(*tok, d, T_i));
+                    std::fprintf(stderr, "[generate] reference [S%zu]: %d frames\n", i + 1, T_i);
+                }
+            } else {
+                ref_codes_vec.push_back(ref_codes);
+                ref_T_vec.push_back(T_ref);
+                reference_blocks.push_back(reference_block);
+            }
+
+            // Assistant prefix: the codes of `reference_wav` — by contract the
+            // concatenation of all speakers (or the single reference), already
+            // normalized and encoded above.
+            if (req.continuation_prefix) {
+                prefix_codes = ref_codes;
+                T_prefix     = T_ref;
+                std::fprintf(stderr, "[generate] assistant continuation prefix: %d frames\n", T_prefix);
+            }
         }
     }
 
@@ -437,12 +580,14 @@ GenerateResult generate(Model & model,
                 // The delay family's continuation layout differs and is
                 // unverified here; failing beats silently ignoring the field
                 // and cloning by a different mechanism than the caller asked for.
+                // (The in-house continuation_prefix above serves that role.)
                 throw std::runtime_error(
                     "generate(): ref_text (continuation mode) is only implemented "
                     "for moss_tts_local");
             }
-            grid = build_prompt_grid(*tok, d, req, reference_block,
-                                     T_ref > 0 ? &ref_codes : nullptr, T_ref,
+            grid = build_prompt_grid(*tok, d, req, reference_blocks,
+                                     ref_codes_vec.empty() ? nullptr : &ref_codes_vec, &ref_T_vec,
+                                     T_prefix > 0 ? &prefix_codes : nullptr, T_prefix,
                                      prompt_len);
             break;
         case Arch::TTSLocal:
@@ -517,6 +662,14 @@ GenerateResult generate(Model & model,
     std::unique_ptr<CodecStreamDecoder> stream;
     int32_t streamed_frames = 0;
     double  stream_seconds  = 0.0;
+    if (cb && T_prefix > 0) {
+        // The continuation prefix is trimmed from the decoded waveform at the
+        // end; a streaming caller would receive the prefix audio before the trim
+        // could happen. Refuse rather than stream the wrong audio.
+        throw std::runtime_error(
+            "generate: streaming is not supported together with the continuation "
+            "prefix yet; disable one of the two");
+    }
     if (cb) {
         if (!model.codec_loaded()) {
             throw std::runtime_error(
@@ -654,6 +807,16 @@ GenerateResult generate(Model & model,
         try {
             auto t_dec = clock_t_::now();
             result.waveform = codec_decode(model, codes.data(), nvq_out, t_audio);
+            // Trim the continuation prefix at SAMPLE level — the codec is
+            // causal, and upstream python does the same
+            // (processing_moss_tts.py:721-738).
+            if (T_prefix > 0) {
+                const int64_t trim = int64_t(T_prefix) * int64_t(d.downsample_rate)
+                                   * int64_t(d.n_channels);
+                if (trim >= int64_t(result.waveform.size())) result.waveform.clear();
+                else result.waveform.erase(result.waveform.begin(), result.waveform.begin() + trim);
+                std::fprintf(stderr, "[generate] trimmed %lld prefix samples\n", (long long)trim);
+            }
             result.decode_seconds = seconds_t(clock_t_::now() - t_dec).count();
             std::fprintf(stderr,
                          "[generate] codec decode produced %zu samples (%.2fs of audio, %d ch) in %.2fs\n",
