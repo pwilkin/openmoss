@@ -41,7 +41,33 @@
 //                                     //   only): the reference goes in the
 //                                     //   assistant channel and the model
 //                                     //   carries on speaking from it.
-//     "references": [ {"ref_audio": str, "ref_text": str} ]   // same, array form
+//     "references": [ {"ref_audio": str, "ref_text": str} ]   // same, array form.
+//                                     //   The delay family accepts SEVERAL
+//                                     //   entries — one per speaker, in [S1],
+//                                     //   [S2], … order. Their transcripts do
+//                                     //   NOT go in ref_text (rejected) but in
+//                                     //   `text`, as "[S1] <transcript1> [S2]
+//                                     //   <transcript2> [S1] <turn> …", per the
+//                                     //   MOSS-TTSD prompt format.
+//     "continuation_prefix": bool,    // default true. Delay family with
+//                                     //   references only: splice the reference
+//                                     //   audio behind the assistant's
+//                                     //   audio_start so the model does not
+//                                     //   re-speak the transcripts. Disable for
+//                                     //   an identity A/B — or to stream, which
+//                                     //   cannot trim the prefix.
+//     "voice":             str,       // a REGISTERED voice id (--voice-dir;
+//                                     //   see /v1/voices). ""/"default" = none.
+//                                     //   Delay family: its stored transcript
+//                                     //   is prepended to `text`.
+//     "voices":            [str, …],  // delay family: one registered voice per
+//                                     //   speaker, [S1]..[Sn] order; stored
+//                                     //   transcripts are prepended as
+//                                     //   "[S1] <t1> [S2] <t2> " so `text`
+//                                     //   carries only the dialogue turns.
+//                                     //   Reference codes are encoded once and
+//                                     //   cached — the encode otherwise
+//                                     //   dominates request latency.
 //     "sampling": {
 //        "text_temperature": float, "text_top_p": float, "text_top_k": int,
 //        "audio_temperature": float, "audio_top_p": float, "audio_top_k": int,
@@ -103,13 +129,19 @@
 // voice, so /v1/audio/voices follows the vLLM-Omni shape and reports the single
 // "default" entry (empty for MOSS-SoundEffect, which has no notion of a voice).
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -138,10 +170,22 @@ namespace {
         "  --n-batch N            libllama batch size (default: 512). Raise if a\n"
         "                         long prompt exceeds this size.\n"
         "  --n-ctx N              libllama context size (default: 8192)\n"
+        "  --template NAME        Prompt template + sampling defaults for the delay\n"
+        "                         family: auto (default), ttsd or voicegen. The two\n"
+        "                         checkpoints ship different processors and decoding\n"
+        "                         hyperparameters but are indistinguishable from the\n"
+        "                         GGUF alone (both have n_vq=16), so `auto` keeps the\n"
+        "                         historical n_vq<32 → voicegen guess; pass\n"
+        "                         `--template ttsd` when serving MOSS-TTSD.\n"
         "  --no-flash-attn\n"
         "  --skip-codec           (no waveform synthesis; codes only — debug)\n"
         "  --aux-cpu              force audio embeds + codec onto CPU\n"
         "                          (workaround for Metal DIAG_MASK_INF)\n"
+        "  --voice-dir DIR        enable the voice registry: persistent named\n"
+        "                          references at DIR/{id}.wav + DIR/{id}.json,\n"
+        "                          managed via /v1/voices and used by passing\n"
+        "                          voice/voices on a speech request. Reference\n"
+        "                          codes are encoded once and cached in memory.\n"
         "  --webui-dir DIR        serve a static WebUI from DIR at /\n"
         "                          (default: auto-detect ./webui or <binary>/webui)\n"
         "  --no-webui             disable WebUI auto-detection\n"
@@ -222,13 +266,150 @@ T jget(const json & j, const char * k, const T & dflt) {
     return it->get<T>();
 }
 
-// Per-model default decoding. The struct defaults suit MOSS-TTS (n_vq=32). The
-// reduced-codebook MOSS-VoiceGenerator (n_vq=16) is sensitive to decoding and
-// degenerates (immediate end-of-speech) at those settings; use its documented
-// recommended hyperparameters instead. Callers can still override per request.
-openmoss::SamplingConfig default_sampling(int n_vq) {
-    openmoss::SamplingConfig sc;
-    if (n_vq < 32) {
+// ── voice registry ────────────────────────────────────────────────────────
+//
+// Persistent named references, mirroring the omnivoice-server contract so a
+// gateway can drive both engines the same way:
+//   POST   /v1/voices          multipart: voice_id|id + audio (file) +
+//                              transcript|text + language? + description?
+//   GET    /v1/voices          {"voices":[{id,transcript,description,language,
+//                              created_at}, …]}
+//   GET    /v1/voices/{id}     metadata          (404 when unknown)
+//   DELETE /v1/voices/{id}     {"id":…,"deleted":true}
+// Storage: {voice-dir}/{id}.wav (bytes as uploaded) + {id}.json. Enabled by
+// --voice-dir. Deliberate deviations from omnivoice: an unknown `voice` on a
+// speech request is a 400 listing the known ids (omnivoice falls back to its
+// auto-voice; silently giving a dialogue speaker the wrong voice is worse
+// than failing), and /v1/voices/design is absent — MOSS designs voices with a
+// separate checkpoint (MOSS-VoiceGenerator), not this one.
+bool valid_voice_id(const std::string & s) {
+    if (s.empty() || s.size() > 64) return false;
+    for (char c : s) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct VoiceMeta {
+    std::string transcript;
+    std::string description;
+    std::string language;
+    std::string created_at;
+};
+
+json voice_meta_json(const std::string & id, const VoiceMeta & m) {
+    return json{
+        {"id",          id},
+        {"transcript",  m.transcript},
+        {"description", m.description},
+        {"language",    m.language},
+        {"created_at",  m.created_at},
+    };
+}
+
+std::string iso8601_now() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return std::string(buf);
+}
+
+struct VoiceStore {
+    std::string dir;   // empty = registry disabled
+
+    bool enabled() const { return !dir.empty(); }
+    std::string wav_path(const std::string & id)  const { return dir + "/" + id + ".wav"; }
+    std::string meta_path(const std::string & id) const { return dir + "/" + id + ".json"; }
+
+    bool exists(const std::string & id) const {
+        std::error_code ec;
+        return std::filesystem::exists(wav_path(id), ec);
+    }
+
+    std::vector<std::string> list() const {
+        std::vector<std::string> out;
+        std::error_code ec;
+        for (const auto & e : std::filesystem::directory_iterator(dir, ec)) {
+            const auto & p = e.path();
+            if (p.extension() != ".wav") continue;
+            const std::string id = p.stem().string();
+            if (valid_voice_id(id)) out.push_back(id);
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    bool load_meta(const std::string & id, VoiceMeta & out) const {
+        std::ifstream f(meta_path(id));
+        if (!f) return false;
+        try {
+            json j = json::parse(f);
+            out.transcript  = j.value("transcript",  "");
+            out.description = j.value("description", "");
+            out.language    = j.value("language",    "");
+            out.created_at  = j.value("created_at",  "");
+        } catch (const std::exception &) {
+            return false;
+        }
+        return true;
+    }
+
+    bool save_meta(const std::string & id, const VoiceMeta & m) const {
+        std::ofstream f(meta_path(id), std::ios::trunc);
+        if (!f) return false;
+        f << voice_meta_json(id, m).dump(2) << "\n";
+        return bool(f);
+    }
+
+    bool save_wav(const std::string & id, const std::string & bytes) const {
+        std::ofstream f(wav_path(id), std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f.write(bytes.data(), std::streamsize(bytes.size()));
+        return bool(f);
+    }
+
+    std::vector<uint8_t> load_wav(const std::string & id) const {
+        std::ifstream f(wav_path(id), std::ios::binary);
+        if (!f) return {};
+        return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {});
+    }
+
+    bool remove(const std::string & id) const {
+        std::error_code ec;
+        bool wav_ok = std::filesystem::remove(wav_path(id), ec);
+        std::filesystem::remove(meta_path(id), ec);
+        return wav_ok;
+    }
+};
+
+// Which delay-family checkpoint this server is treating the model as. The two
+// reduced-codebook checkpoints — MOSS-TTSD and MOSS-VoiceGenerator — ship
+// different prompt templates and decoding hyperparameters but are
+// indistinguishable from the GGUF alone (both have n_vq=16), so the operator
+// says which one they loaded via --template; `Auto` keeps the historical
+// n_vq<32 → voicegen guess.
+enum class DelayTemplate { Auto, TTSD, VoiceGen };
+
+// Per-model default decoding: the library's per-family defaults, then (delay
+// family) the loaded checkpoint's own documented values. Mirrors the CLI.
+// TTSD ships generation_config.json with 1.1/0.9/50/1.1; VoiceGenerator
+// documents 1.5/0.6/50/1.1 in modeling_moss_tts.py:401-404 and its model card,
+// with the warning that it is sensitive to these — at the flagship's struct
+// defaults it degenerates (immediate end-of-speech). Callers can still
+// override per request.
+openmoss::SamplingConfig default_sampling(openmoss::Arch arch,
+                                          bool ttsd_mode, bool voicegen_mode) {
+    openmoss::SamplingConfig sc = openmoss::default_sampling(arch);
+    if (ttsd_mode) {
+        sc.audio_temperature        = 1.1f;
+        sc.audio_top_p              = 0.9f;
+        sc.audio_top_k              = 50;
+        sc.audio_repetition_penalty = 1.1f;
+    } else if (voicegen_mode) {
         sc.audio_temperature        = 1.5f;
         sc.audio_top_p              = 0.6f;
         sc.audio_top_k              = 50;
@@ -258,15 +439,17 @@ openmoss::SamplingConfig parse_sampling(const json & j, const openmoss::Sampling
     return sc;
 }
 
-// MOSS-VoiceGenerator (n_vq<32) has no reference audio to anchor length: left
-// free it either collapses the segment on the first frame (degenerate immediate
+// MOSS-VoiceGenerator has no reference audio to anchor length: left free it
+// either collapses the segment on the first frame (degenerate immediate
 // end-of-speech) or rambles for minutes. Estimate a length from the text when the
 // caller gave none, then bound the generated segment around it — floor at 3/4
 // (render the text, no early collapse), cap at 3/2 (no ramble) — leaving a
-// natural-ending window in between. No-op for full MOSS-TTS (n_vq>=32), which is
-// anchored by its reference audio.
-void finalize_voicegen_request(openmoss::GenerateRequest & req, const openmoss::ModelDims & dims) {
-    if (dims.n_vq >= 32) return;
+// natural-ending window in between. Only in voicegen mode: MOSS-TTS and
+// MOSS-TTSD are anchored by their reference audio and stop on their own — the
+// word-count estimate would truncate a multi-speaker dialogue whose text also
+// carries the reference transcripts.
+void finalize_voicegen_request(openmoss::GenerateRequest & req, bool voicegen_mode) {
+    if (!voicegen_mode) return;
     if (!req.tokens && !req.text.empty()) {
         // ~12.5 audio tokens/s at ~2.5 words/s -> ~5 tokens/word.
         int words = 1;
@@ -328,46 +511,52 @@ int extract_token_prefix(std::string & text) {
     return n;
 }
 
-// Pull reference audio (and optionally its transcript) out of a request. Two
-// shapes are accepted: the legacy scalar `reference_wav_b64`, and the cookbooks'
-// `references[]` array of {ref_audio, ref_text}.
+// Pull reference audio (and optionally transcripts) out of a request. Two
+// shapes are accepted: the legacy scalar `reference_wav_b64` (+ top-level
+// `ref_text`), and the cookbooks' `references[]` array of {ref_audio, ref_text}.
 //
-// Supplying `ref_text` selects continuation mode: the reference goes in the
-// assistant channel behind the generation slot with no closing audio_end, and
-// the model carries on speaking from it. That layout is only implemented for
-// moss_tts_local; generate() rejects it for the delay family rather than
-// silently cloning by a different mechanism.
+// How many entries are allowed and what `ref_text` means is per-family and
+// enforced by the caller, not here:
+//   - moss_tts_local: one reference; `ref_text` selects continuation mode.
+//   - delay family:   one reference per speaker, [S1], [S2], … order;
+//                     transcripts belong in `text`, not in `ref_text`.
 //
-// Returns false and fills `err` on a malformed request. `out_b64` is left empty
+// Returns false and fills `err` on a malformed request. `out` is left empty
 // when the request carries no reference at all.
-bool extract_reference(const json & body, std::string & out_b64,
-                       std::string & out_text, std::string & err) {
+struct RefEntry {
+    std::string b64;
+    std::string text;
+};
+
+bool extract_references(const json & body, std::vector<RefEntry> & out,
+                        std::string & err) {
     if (body.contains("references")) {
         const json & refs = body["references"];
         if (!refs.is_array()) { err = "'references' must be an array"; return false; }
-        if (refs.empty()) return true;
-        if (refs.size() > 1) {
-            err = "only one reference is supported; got " + std::to_string(refs.size());
-            return false;
-        }
-        const json & r = refs[0];
-        if (!r.is_object()) { err = "each entry in 'references' must be an object"; return false; }
-        if (!r.contains("ref_audio") || !r["ref_audio"].is_string()) {
-            err = "'references[0].ref_audio' must be a base64 WAV string";
-            return false;
-        }
-        out_b64 = r["ref_audio"].get<std::string>();
-        if (r.contains("ref_text") && r["ref_text"].is_string()) {
-            out_text = r["ref_text"].get<std::string>();
+        for (size_t i = 0; i < refs.size(); ++i) {
+            const json & r = refs[i];
+            if (!r.is_object()) { err = "each entry in 'references' must be an object"; return false; }
+            if (!r.contains("ref_audio") || !r["ref_audio"].is_string()) {
+                err = "'references[" + std::to_string(i) + "].ref_audio' must be a base64 WAV string";
+                return false;
+            }
+            RefEntry e;
+            e.b64 = r["ref_audio"].get<std::string>();
+            if (r.contains("ref_text") && r["ref_text"].is_string()) {
+                e.text = r["ref_text"].get<std::string>();
+            }
+            out.push_back(std::move(e));
         }
         return true;
     }
+    RefEntry e;
     if (body.contains("reference_wav_b64") && body["reference_wav_b64"].is_string()) {
-        out_b64 = body["reference_wav_b64"].get<std::string>();
+        e.b64 = body["reference_wav_b64"].get<std::string>();
     }
     if (body.contains("ref_text") && body["ref_text"].is_string()) {
-        out_text = body["ref_text"].get<std::string>();
+        e.text = body["ref_text"].get<std::string>();
     }
+    if (!e.b64.empty() || !e.text.empty()) out.push_back(std::move(e));
     return true;
 }
 
@@ -384,6 +573,8 @@ int main(int argc, char ** argv) {
     bool flash_attn   = true;
     bool skip_codec   = false;
     bool aux_cpu      = false;
+    DelayTemplate tpl = DelayTemplate::Auto;
+    std::string voice_dir;
     std::string webui_dir_arg;
     bool no_webui     = false;
 
@@ -403,6 +594,18 @@ int main(int argc, char ** argv) {
         else if (k == "--no-flash-attn")  flash_attn   = false;
         else if (k == "--skip-codec")     skip_codec   = true;
         else if (k == "--aux-cpu")        aux_cpu      = true;
+        else if (k == "--template") {
+            const std::string v = next();
+            if      (v == "auto")     tpl = DelayTemplate::Auto;
+            else if (v == "ttsd")     tpl = DelayTemplate::TTSD;
+            else if (v == "voicegen") tpl = DelayTemplate::VoiceGen;
+            else {
+                std::fprintf(stderr, "unknown --template: %s (expected auto, ttsd or voicegen)\n",
+                             v.c_str());
+                usage(2);
+            }
+        }
+        else if (k == "--voice-dir")      voice_dir     = next();
         else if (k == "--webui-dir")      webui_dir_arg = next();
         else if (k == "--no-webui")       no_webui     = true;
         else if (k == "--help" || k == "-h") usage(0);
@@ -422,6 +625,117 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr,
                   "[server] model loaded; codec=%s\n",
                   model->codec_loaded() ? "on" : "off");
+
+    // Resolve which delay checkpoint this server is treating the model as.
+    // Explicit --template wins; Auto keeps the historical n_vq guess.
+    if (tpl != DelayTemplate::Auto &&
+        model->dims().arch != openmoss::Arch::TTSDelay) {
+        std::fprintf(stderr,
+            "--template applies to the delay family only; this model is %s\n",
+            openmoss::arch_name(model->dims().arch));
+        return 2;
+    }
+    const bool delay_arch    = model->dims().arch == openmoss::Arch::TTSDelay;
+    const bool ttsd_mode     = tpl == DelayTemplate::TTSD;
+    const bool voicegen_mode = tpl == DelayTemplate::VoiceGen ||
+        (tpl == DelayTemplate::Auto && delay_arch && model->dims().n_vq < 32);
+    if (delay_arch) {
+        std::fprintf(stderr, "[server] delay template: %s%s\n",
+                     ttsd_mode ? "ttsd" : voicegen_mode ? "voicegen" : "moss_tts",
+                     tpl == DelayTemplate::Auto
+                         ? " (guessed from n_vq — pass --template ttsd when serving MOSS-TTSD)"
+                         : "");
+    }
+    const openmoss::SamplingConfig base_sampling =
+        default_sampling(model->dims().arch, ttsd_mode, voicegen_mode);
+
+    // Shared by /tts and /v1/audio/speech: pull references out of the body,
+    // decode them, and put them on the request in the family's own shape —
+    // moss_tts_local's single reference (+ optional ref_text continuation), or
+    // the delay family's one-reference-per-speaker with the concatenation
+    // feeding the assistant-side continuation prefix, exactly as the CLI's
+    // --speaker-ref does. Returns false and fills `err` (a 400) on a request
+    // the family cannot honor.
+    auto apply_references = [&](const json & body, openmoss::GenerateRequest & req,
+                                std::string & err) -> bool {
+        std::vector<RefEntry> refs;
+        if (!extract_references(body, refs, err)) return false;
+        if (refs.empty()) return true;
+        for (const auto & r : refs) {
+            if (r.b64.empty()) {
+                err = "ref_text was supplied without reference audio; continuation "
+                      "mode needs both";
+                return false;
+            }
+        }
+        if (!delay_arch && refs.size() > 1) {
+            err = "only one reference is supported for " +
+                  std::string(openmoss::arch_name(model->dims().arch)) +
+                  "; got " + std::to_string(refs.size());
+            return false;
+        }
+        if (delay_arch) {
+            for (const auto & r : refs) {
+                if (!r.text.empty()) {
+                    err = "the delay family takes reference transcripts in `text` "
+                          "(\"[S1] <transcript1> [S2] <transcript2> [S1] <turn> …\"), "
+                          "not in ref_text — that field selects moss_tts_local's "
+                          "continuation mode";
+                    return false;
+                }
+            }
+        } else if (!refs[0].text.empty()) {
+            req.ref_text = refs[0].text;
+        }
+        std::vector<std::vector<float>> wavs;
+        for (size_t i = 0; i < refs.size(); ++i) {
+            try {
+                auto wav_bytes = b64_decode(refs[i].b64);
+                // Channel-aware for the same reason the encoder is: the codec
+                // for MOSS-TTS-Local expects a 2-channel interleaved reference,
+                // and decode_wav adapts the file (downmix, or duplicate a mono
+                // one) rather than silently handing over half a signal.
+                wavs.push_back(openmoss::decode_wav(
+                    wav_bytes.data(), wav_bytes.size(),
+                    model->dims().sampling_rate,
+                    model->dims().n_channels));
+            } catch (const std::exception & e) {
+                err = "could not decode reference audio";
+                if (refs.size() > 1) err += " [" + std::to_string(i) + "]";
+                err += ": ";
+                err += e.what();
+                return false;
+            }
+        }
+        if (wavs.size() == 1) {
+            req.reference_wav = std::move(wavs[0]);
+        } else {
+            // One reference per speaker -> its own [S{i}] block in the user
+            // turn; their concatenation feeds the assistant continuation prefix.
+            std::vector<float> concat;
+            for (const auto & w : wavs) concat.insert(concat.end(), w.begin(), w.end());
+            req.reference_wavs = std::move(wavs);
+            req.reference_wav  = std::move(concat);
+        }
+        return true;
+    };
+
+    // The pipeline refuses to stream together with the continuation prefix (the
+    // reference audio would be streamed back before it could be trimmed), but by
+    // the time it throws the status line is long gone and the client sees a
+    // truncated stream. Catch the combination while a 400 is still possible.
+    auto stream_prefix_error = [&](const openmoss::GenerateRequest & req,
+                                   bool want_stream) -> const char * {
+        if (want_stream && delay_arch && req.continuation_prefix &&
+            (req.reference_wav || !req.reference_wavs.empty() ||
+             !req.reference_codes.empty())) {
+            return "streaming is not supported together with the continuation "
+                   "prefix: the reference audio would be streamed back before it "
+                   "could be trimmed. Pass continuation_prefix=false (the model "
+                   "then re-speaks the reference transcripts) or drop stream.";
+        }
+        return nullptr;
+    };
 
     httplib::Server svr;
 
@@ -445,6 +759,158 @@ int main(int argc, char ** argv) {
     std::mutex gen_mu;
     std::atomic<uint64_t> n_requests{0};
 
+    // ── voice registry state ──────────────────────────────────────────────
+    VoiceStore store{voice_dir};
+    if (store.enabled()) {
+        std::error_code ec;
+        std::filesystem::create_directories(store.dir, ec);
+        if (ec) {
+            std::fprintf(stderr, "--voice-dir %s: cannot create directory (%s)\n",
+                         store.dir.c_str(), ec.message().c_str());
+            return 2;
+        }
+        if (model->dims().arch == openmoss::Arch::SoundEffect) {
+            std::fprintf(stderr,
+                "--voice-dir applies to the TTS families only; this model is moss_soundeffect\n");
+            return 2;
+        }
+        std::fprintf(stderr, "[server] voice registry at %s (%zu voices)\n",
+                     store.dir.c_str(), store.list().size());
+    }
+    std::mutex reg_mu;   // guards codes_cache and store mutations
+    std::map<std::string, openmoss::EncodedReference> codes_cache;
+
+    // Resolve registered voice ids to cached reference codes, encoding on
+    // first use. The encode is model state, so it runs under the generation
+    // mutex; every later request is a cache hit and skips it (~25 s per
+    // reference on CPU). Fills req.reference_codes and the transcripts, in
+    // order; false + `err` (a 400 text) on any unknown id.
+    auto resolve_voices = [&](const std::vector<std::string> & ids,
+                              openmoss::GenerateRequest & req,
+                              std::vector<std::string> & transcripts,
+                              std::string & err) -> bool {
+        for (const auto & id : ids) {
+            if (!valid_voice_id(id) || !store.exists(id)) {
+                std::string all;
+                for (const auto & k : store.list()) {
+                    if (!all.empty()) all += ", ";
+                    all += k;
+                }
+                err = "unknown voice '" + id + "'; registered: [" + all + "]";
+                return false;
+            }
+        }
+        for (const auto & id : ids) {
+            VoiceMeta m;
+            store.load_meta(id, m);
+            transcripts.push_back(m.transcript);
+            {
+                std::lock_guard<std::mutex> rg(reg_mu);
+                auto it = codes_cache.find(id);
+                if (it != codes_cache.end()) {
+                    req.reference_codes.push_back(it->second);
+                    continue;
+                }
+            }
+            auto wav_bytes = store.load_wav(id);
+            if (wav_bytes.empty()) {
+                err = "voice '" + id + "': cannot read its WAV from the registry";
+                return false;
+            }
+            std::vector<float> wav;
+            try {
+                wav = openmoss::decode_wav(wav_bytes.data(), wav_bytes.size(),
+                                           model->dims().sampling_rate,
+                                           model->dims().n_channels);
+            } catch (const std::exception & e) {
+                err = "voice '" + id + "': " + e.what();
+                return false;
+            }
+            openmoss::EncodedReference enc;
+            try {
+                std::lock_guard<std::mutex> g(gen_mu);
+                const auto t0 = std::chrono::steady_clock::now();
+                enc = openmoss::encode_reference(*model, std::move(wav));
+                std::fprintf(stderr,
+                    "[server] voice '%s' encoded: %d frames in %.2fs (now cached)\n",
+                    id.c_str(), enc.n_frames,
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t0).count());
+            } catch (const std::exception & e) {
+                err = "voice '" + id + "': encode failed: ";
+                err += e.what();
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> rg(reg_mu);
+                codes_cache[id] = enc;
+            }
+            req.reference_codes.push_back(std::move(enc));
+        }
+        return true;
+    };
+
+    // Registered-voice request path: resolve ids to cached codes and, for the
+    // delay family, prepend the stored transcripts so `text` carries only the
+    // new material ("[S1] <t1> [S2] <t2> " for dialogues — the continuation
+    // prefix means the model treats the transcripts as already spoken).
+    // Callers have already checked mutual exclusion with inline references.
+    auto use_voices = [&](const std::vector<std::string> & ids,
+                          openmoss::GenerateRequest & req,
+                          std::string & err) -> bool {
+        if (!store.enabled()) {
+            err = "voice registry disabled: start the server with --voice-dir";
+            return false;
+        }
+        if (ids.size() > 1 && !delay_arch) {
+            err = "'voices' (multi-speaker) is only supported by the delay family";
+            return false;
+        }
+        std::vector<std::string> transcripts;
+        if (!resolve_voices(ids, req, transcripts, err)) return false;
+        if (delay_arch) {
+            std::string prefix;
+            for (size_t i = 0; i < transcripts.size(); ++i) {
+                if (ids.size() > 1) prefix += "[S" + std::to_string(i + 1) + "] ";
+                prefix += transcripts[i];
+                if (!prefix.empty() && prefix.back() != ' ') prefix += ' ';
+            }
+            req.text = prefix + req.text;
+        }
+        return true;
+    };
+
+    // Pull `voice` (string) / `voices` (array) out of a request body. Returns
+    // false + err on a malformed combination; `ids` stays empty when the
+    // request names no registered voice ("" and "default" mean none).
+    auto extract_voice_ids = [](const json & body, std::vector<std::string> & ids,
+                                std::string & err) -> bool {
+        if (body.contains("voices")) {
+            if (!body["voices"].is_array()) {
+                err = "'voices' must be an array of registered voice ids";
+                return false;
+            }
+            for (const auto & v : body["voices"]) {
+                if (!v.is_string()) {
+                    err = "'voices' must be an array of strings";
+                    return false;
+                }
+                ids.push_back(v.get<std::string>());
+            }
+        }
+        if (body.contains("voice") && body["voice"].is_string()) {
+            const std::string v = body["voice"].get<std::string>();
+            if (!v.empty() && v != "default") {
+                if (!ids.empty()) {
+                    err = "pass either 'voice' or 'voices', not both";
+                    return false;
+                }
+                ids.push_back(v);
+            }
+        }
+        return true;
+    };
+
     svr.Get("/health", [](const httplib::Request &, httplib::Response & rs) {
         rs.set_content("ok\n", "text/plain");
     });
@@ -464,6 +930,15 @@ int main(int argc, char ** argv) {
             {"codec_loaded",      model->codec_loaded()},
             {"requests_served",   uint64_t(n_requests.load())},
         };
+        // Which checkpoint the delay family is being served as — the GGUF alone
+        // cannot tell MOSS-TTSD and MOSS-VoiceGenerator apart (both n_vq=16),
+        // so a gateway should check this matches the model it deployed.
+        if (d.arch == openmoss::Arch::TTSDelay) {
+            info["prompt_template"] =
+                ttsd_mode ? "ttsd" : voicegen_mode ? "voicegen" : "moss_tts";
+        }
+        info["voice_registry"] = store.enabled();
+        if (store.enabled()) info["n_voices"] = store.list().size();
         // MOSS-SoundEffect has no codec and no codebooks; what a caller needs to
         // know is the solver surface and the fixed duration ceiling.
         if (d.arch == openmoss::Arch::SoundEffect) {
@@ -505,8 +980,111 @@ int main(int argc, char ** argv) {
                 {"name",        "default"},
                 {"description", "the model's own voice; pass reference audio to clone another"},
             });
+            if (store.enabled()) {
+                for (const auto & id : store.list()) {
+                    VoiceMeta m;
+                    store.load_meta(id, m);
+                    voices.push_back(json{
+                        {"id",          id},
+                        {"name",        id},
+                        {"description", m.description.empty() ? m.transcript
+                                                              : m.description},
+                    });
+                }
+            }
         }
         rs.set_content(json{{"object", "list"}, {"data", voices}}.dump(),
+                       "application/json");
+    });
+
+    // ── voice registry endpoints (contract in the header comment) ─────────
+    auto registry_disabled = [&](httplib::Response & rs) -> bool {
+        if (store.enabled()) return false;
+        send_text_error(rs, 400,
+            "voice registry disabled: start the server with --voice-dir");
+        return true;
+    };
+
+    svr.Post("/v1/voices", [&](const httplib::Request & rq, httplib::Response & rs) {
+        if (registry_disabled(rs)) return;
+        auto field = [&](const char * n) -> std::string {
+            return rq.has_file(n) ? rq.get_file_value(n).content : std::string();
+        };
+        std::string id = field("voice_id");
+        if (id.empty()) id = field("id");
+        std::string audio      = field("audio");
+        std::string transcript = field("transcript");
+        if (transcript.empty()) transcript = field("text");
+        if (transcript.empty()) transcript = field("description");
+        if (!valid_voice_id(id) || audio.empty() || transcript.empty()) {
+            return send_text_error(rs, 400,
+                "voice_id (alnum/_/-, <=64), audio and transcript are required "
+                "(multipart form-data)");
+        }
+        // Validate the WAV now — a broken reference should fail at
+        // registration, not on its first use in a request.
+        try {
+            (void)openmoss::decode_wav(
+                reinterpret_cast<const uint8_t *>(audio.data()), audio.size(),
+                model->dims().sampling_rate, model->dims().n_channels);
+        } catch (const std::exception & e) {
+            return send_text_error(rs, 400,
+                std::string("audio is not a usable WAV: ") + e.what());
+        }
+        std::lock_guard<std::mutex> rg(reg_mu);
+        if (store.exists(id)) {
+            return send_text_error(rs, 409, "voice '" + id + "' already exists");
+        }
+        if (!store.save_wav(id, audio)) {
+            return send_text_error(rs, 500, "failed to persist voice WAV");
+        }
+        VoiceMeta m;
+        m.transcript  = transcript;
+        m.description = field("description");
+        m.language    = field("language");
+        m.created_at  = iso8601_now();
+        if (!store.save_meta(id, m)) {
+            std::error_code ec;
+            std::filesystem::remove(store.wav_path(id), ec);
+            return send_text_error(rs, 500, "failed to persist voice metadata");
+        }
+        std::fprintf(stderr, "[server] voice '%s' registered (%zu bytes, lang=%s)\n",
+                     id.c_str(), audio.size(), m.language.c_str());
+        rs.status = 201;
+        rs.set_content(voice_meta_json(id, m).dump(), "application/json");
+    });
+
+    svr.Get("/v1/voices", [&](const httplib::Request &, httplib::Response & rs) {
+        if (registry_disabled(rs)) return;
+        json out = json::array();
+        for (const auto & id : store.list()) {
+            VoiceMeta m;
+            store.load_meta(id, m);
+            out.push_back(voice_meta_json(id, m));
+        }
+        rs.set_content(json{{"voices", out}}.dump(), "application/json");
+    });
+
+    svr.Get(R"(/v1/voices/([A-Za-z0-9_\-]{1,64}))",
+            [&](const httplib::Request & rq, httplib::Response & rs) {
+        if (registry_disabled(rs)) return;
+        const std::string id = rq.matches[1];
+        if (!store.exists(id)) return send_text_error(rs, 404, "voice not found");
+        VoiceMeta m;
+        store.load_meta(id, m);
+        rs.set_content(voice_meta_json(id, m).dump(), "application/json");
+    });
+
+    svr.Delete(R"(/v1/voices/([A-Za-z0-9_\-]{1,64}))",
+               [&](const httplib::Request & rq, httplib::Response & rs) {
+        if (registry_disabled(rs)) return;
+        const std::string id = rq.matches[1];
+        std::lock_guard<std::mutex> rg(reg_mu);
+        if (!store.exists(id)) return send_text_error(rs, 404, "voice not found");
+        if (!store.remove(id)) return send_text_error(rs, 500, "failed to delete voice");
+        codes_cache.erase(id);
+        std::fprintf(stderr, "[server] voice '%s' deleted\n", id.c_str());
+        rs.set_content(json{{"id", id}, {"deleted", true}}.dump(),
                        "application/json");
     });
 
@@ -742,38 +1320,37 @@ int main(int argc, char ** argv) {
         req.max_new_tokens  = jget(body, "max_new_tokens", req.max_new_tokens);
         req.stream_chunk_frames =
             std::max(1, jget(body, "stream_chunk_frames", req.stream_chunk_frames));
+        if (ttsd_mode) req.prompt_template = openmoss::PromptTemplate::TTSD;
+        req.continuation_prefix = jget(body, "continuation_prefix",
+                                       req.continuation_prefix);
         req.sampling        = parse_sampling(body.value("sampling", json::object()),
-                                             default_sampling(model->dims().n_vq));
-        finalize_voicegen_request(req, model->dims());
+                                             base_sampling);
+        finalize_voicegen_request(req, voicegen_mode);
 
         {
-            std::string ref_b64, ref_text, ref_err;
-            if (!extract_reference(body, ref_b64, ref_text, ref_err)) {
+            std::string ref_err;
+            if (!apply_references(body, req, ref_err)) {
                 return send_text_error(rs, 400, ref_err);
             }
-            if (!ref_text.empty() && ref_b64.empty()) {
-                return send_text_error(rs, 400,
-                    "ref_text was supplied without reference audio; continuation "
-                    "mode needs both");
+        }
+        {
+            std::vector<std::string> voice_ids;
+            std::string verr;
+            if (!extract_voice_ids(body, voice_ids, verr)) {
+                return send_text_error(rs, 400, verr);
             }
-            if (!ref_text.empty()) req.ref_text = ref_text;
-            if (!ref_b64.empty()) {
-                try {
-                    auto wav_bytes = b64_decode(ref_b64);
-                    // Channel-aware for the same reason the encoder is: the codec
-                    // for MOSS-TTS-Local expects a 2-channel interleaved
-                    // reference, and decode_wav adapts the file (downmix, or
-                    // duplicate a mono one) rather than silently handing over
-                    // half a signal.
-                    req.reference_wav = openmoss::decode_wav(
-                        wav_bytes.data(), wav_bytes.size(),
-                        model->dims().sampling_rate,
-                        model->dims().n_channels);
-                } catch (const std::exception & e) {
+            if (!voice_ids.empty()) {
+                if (req.reference_wav || !req.reference_wavs.empty()) {
                     return send_text_error(rs, 400,
-                        std::string("could not decode reference audio: ") + e.what());
+                        "pass either registered voices or inline references, not both");
+                }
+                if (!use_voices(voice_ids, req, verr)) {
+                    return send_text_error(rs, 400, verr);
                 }
             }
+        }
+        if (const char * msg = stream_prefix_error(req, want_stream)) {
+            return send_text_error(rs, 400, msg);
         }
 
         if (want_stream) return stream_tts(std::move(req), req_id, rs);
@@ -782,10 +1359,13 @@ int main(int argc, char ** argv) {
         try {
             std::lock_guard<std::mutex> g(gen_mu);
             std::fprintf(stderr,
-                "[server] req#%llu text=%zu chars ref=%s max=%d\n",
+                "[server] req#%llu text=%zu chars refs=%zu max=%d\n",
                 (unsigned long long)req_id,
                 req.text.size(),
-                req.reference_wav ? "yes" : "no",
+                !req.reference_codes.empty()
+                    ? req.reference_codes.size()
+                    : (req.reference_wavs.empty() ? size_t(req.reference_wav ? 1 : 0)
+                                                  : req.reference_wavs.size()),
                 req.max_new_tokens);
             result = openmoss::generate(*model, req);
         } catch (const std::exception & e) {
@@ -879,39 +1459,42 @@ int main(int argc, char ** argv) {
         if (body.contains("token_count") && body["token_count"].is_number_integer())
             req.tokens = body["token_count"].get<int>();
 
-        // "voice" → instruction hint (e.g. "alloy", "echo", …).
-        if (body.contains("voice") && body["voice"].is_string()) {
-            req.instruction = body["voice"].get<std::string>();
+        // "voice": with the registry enabled it names a registered voice
+        // ("" and "default" mean none); without --voice-dir it stays the
+        // legacy instruction hint (e.g. "alloy") it always was — except that
+        // ""/"default" no longer become a literal instruction string.
+        std::vector<std::string> voice_ids;
+        if (store.enabled()) {
+            std::string verr;
+            if (!extract_voice_ids(body, voice_ids, verr)) {
+                return send_text_error(rs, 400, verr);
+            }
+        } else {
+            if (body.contains("voices")) {
+                return send_text_error(rs, 400,
+                    "voice registry disabled: start the server with --voice-dir");
+            }
+            if (body.contains("voice") && body["voice"].is_string()) {
+                const std::string v = body["voice"].get<std::string>();
+                if (!v.empty() && v != "default") req.instruction = v;
+            }
         }
 
-        // Voice cloning: a base64 WAV reference the model continues in.
+        // Voice cloning: base64 WAV reference(s) the model continues in.
         {
-            std::string ref_b64, ref_text, ref_err;
-            if (!extract_reference(body, ref_b64, ref_text, ref_err)) {
+            std::string ref_err;
+            if (!apply_references(body, req, ref_err)) {
                 return send_text_error(rs, 400, ref_err);
             }
-            if (!ref_text.empty() && ref_b64.empty()) {
+        }
+        if (!voice_ids.empty()) {
+            if (req.reference_wav || !req.reference_wavs.empty()) {
                 return send_text_error(rs, 400,
-                    "ref_text was supplied without reference audio; continuation "
-                    "mode needs both");
+                    "pass either registered voices or inline references, not both");
             }
-            if (!ref_text.empty()) req.ref_text = ref_text;
-            if (!ref_b64.empty()) {
-                try {
-                    auto wav_bytes = b64_decode(ref_b64);
-                    // Channel-aware for the same reason the encoder is: the codec
-                    // for MOSS-TTS-Local expects a 2-channel interleaved
-                    // reference, and decode_wav adapts the file (downmix, or
-                    // duplicate a mono one) rather than silently handing over
-                    // half a signal.
-                    req.reference_wav = openmoss::decode_wav(
-                        wav_bytes.data(), wav_bytes.size(),
-                        model->dims().sampling_rate,
-                        model->dims().n_channels);
-                } catch (const std::exception & e) {
-                    return send_text_error(rs, 400,
-                        std::string("could not decode reference audio: ") + e.what());
-                }
+            std::string verr;
+            if (!use_voices(voice_ids, req, verr)) {
+                return send_text_error(rs, 400, verr);
             }
         }
 
@@ -928,13 +1511,19 @@ int main(int argc, char ** argv) {
         // Sampling can arrive nested under "sampling" (our own shape) or
         // flattened at the top level, which is what the cookbooks send. The
         // nested form is applied first so explicit flat keys win.
+        if (ttsd_mode) req.prompt_template = openmoss::PromptTemplate::TTSD;
+        req.continuation_prefix = jget(body, "continuation_prefix",
+                                       req.continuation_prefix);
         req.sampling       = parse_sampling(body.value("sampling", json::object()),
-                                            default_sampling(model->dims().n_vq));
+                                            base_sampling);
         req.sampling       = parse_sampling(body, req.sampling);
         req.stream_chunk_frames =
             std::max(1, jget(body, "stream_chunk_frames", req.stream_chunk_frames));
-        finalize_voicegen_request(req, model->dims());
+        finalize_voicegen_request(req, voicegen_mode);
 
+        if (const char * msg = stream_prefix_error(req, want_stream)) {
+            return send_text_error(rs, 400, msg);
+        }
         if (want_stream) return stream_tts(std::move(req), req_id, rs);
 
         openmoss::GenerateResult result;

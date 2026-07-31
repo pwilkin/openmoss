@@ -24,6 +24,14 @@ namespace openmoss {
 // prompt layout upstream's moss-prompt-probe validates.
 enum class PromptTemplate { VoiceGen, TTSD };
 
+// In-house: a codec-encoded reference; `codes` is (n_vq, n_frames) row-major.
+// Produced by encode_reference() and consumed via
+// GenerateRequest::reference_codes so callers can cache the encode.
+struct EncodedReference {
+    std::vector<int32_t> codes;
+    int32_t              n_frames = 0;
+};
+
 struct GenerateRequest {
     std::string text;
     // Channel-interleaved f32 at the model's sampling rate / channel count.
@@ -44,6 +52,18 @@ struct GenerateRequest {
     // concatenation of all speakers — that is what feeds the assistant-side
     // continuation prefix.
     std::vector<std::vector<float>>   reference_wavs;
+    // In-house: pre-encoded references, used INSTEAD of encoding
+    // reference_wav/reference_wavs when non-empty. One entry = the
+    // single-reference layout; several = one per speaker, [S1]..[Sn] (delay
+    // family only; moss_tts_local takes exactly one). The reference encode
+    // dominates request latency (~25 s for a 7 s reference on CPU), so a
+    // caller reusing voices — the server's voice registry — encodes once via
+    // encode_reference() and passes the codes here. Delay-family nuance: the
+    // continuation prefix becomes the frame-wise concatenation of these
+    // codes, which keeps it identical to the [S{i}] block codes; the wav path
+    // re-encodes the concatenated waveform instead, so boundary frames can
+    // differ slightly between the two paths.
+    std::vector<EncodedReference>     reference_codes;
     PromptTemplate                    prompt_template = PromptTemplate::VoiceGen;
     // Assistant-side continuation prefix: encode `reference_wav` and place it
     // behind the assistant's audio_start as gen_slot rows (upstream's
@@ -101,6 +121,15 @@ using StreamCallback = std::function<void(const float * pcm, int64_t n_samples)>
 GenerateResult generate(Model & model,
                         const GenerateRequest & req,
                         StreamCallback cb = {});
+
+// In-house: encode one reference waveform (channel-interleaved f32 at the
+// model's rate) to codec codes, applying the family's normalization policy
+// (delay family loudness-normalizes to −20 dBFS unless `normalize` is false;
+// moss_tts_local does not normalize, matching generate()). This is the same
+// path generate() takes internally — cache the result and pass it via
+// GenerateRequest::reference_codes to skip the encode on later requests.
+EncodedReference encode_reference(Model & model, std::vector<float> wav,
+                                  bool normalize = true);
 
 // Test seam: build the prompt grid alone, with reference codes supplied
 // directly rather than encoded from audio. Prompt construction has no numerical

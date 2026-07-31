@@ -513,7 +513,59 @@ GenerateResult generate(Model & model,
     std::vector<std::string>          reference_blocks;
     std::vector<int32_t>              prefix_codes;
     int32_t                           T_prefix = 0;
-    if (req.reference_wav && !req.reference_wav->empty()) {
+    if (!req.reference_codes.empty()) {
+        // Pre-encoded references from a caching caller (the server's voice
+        // registry): the same layouts the wav path below produces, minus the
+        // per-request codec encode.
+        for (const auto & r : req.reference_codes) {
+            if (r.n_frames <= 0 ||
+                r.codes.size() != size_t(n_vq) * size_t(r.n_frames)) {
+                throw std::runtime_error(
+                    "generate: reference_codes entry is not (n_vq, n_frames) "
+                    "row-major for this model");
+            }
+        }
+        if (d.arch == Arch::TTSDelay) {
+            for (size_t i = 0; i < req.reference_codes.size(); ++i) {
+                const auto & r = req.reference_codes[i];
+                ref_codes_vec.push_back(r.codes);
+                ref_T_vec.push_back(r.n_frames);
+                reference_blocks.push_back(build_reference_audio_block(*tok, d, r.n_frames));
+                std::fprintf(stderr, "[generate] reference [S%zu]: %d frames (cached codes)\n",
+                             i + 1, r.n_frames);
+            }
+            if (req.continuation_prefix) {
+                // Frame-wise concatenation per codebook row. Unlike the wav
+                // path — which re-encodes the concatenated waveform — this
+                // keeps the prefix identical to the [S{i}] block codes.
+                T_prefix = 0;
+                for (const auto & r : req.reference_codes) T_prefix += r.n_frames;
+                prefix_codes.assign(size_t(n_vq) * size_t(T_prefix), 0);
+                int32_t off = 0;
+                for (const auto & r : req.reference_codes) {
+                    for (int32_t i = 0; i < n_vq; ++i) {
+                        std::copy(r.codes.begin() + size_t(i) * size_t(r.n_frames),
+                                  r.codes.begin() + size_t(i + 1) * size_t(r.n_frames),
+                                  prefix_codes.begin() + size_t(i) * size_t(T_prefix) + off);
+                    }
+                    off += r.n_frames;
+                }
+                std::fprintf(stderr,
+                             "[generate] assistant continuation prefix: %d frames (cached codes)\n",
+                             T_prefix);
+            }
+        } else if (d.arch == Arch::TTSLocal) {
+            if (req.reference_codes.size() != 1) {
+                throw std::runtime_error(
+                    "generate: moss_tts_local takes exactly one reference");
+            }
+            ref_codes = req.reference_codes[0].codes;
+            T_ref     = req.reference_codes[0].n_frames;
+        } else {
+            throw std::runtime_error(
+                "generate: reference_codes is not supported for this architecture");
+        }
+    } else if (req.reference_wav && !req.reference_wav->empty()) {
         if (!model.codec_loaded())
             throw std::runtime_error("generate: reference_wav supplied but codec is not loaded");
 
@@ -838,6 +890,25 @@ GenerateResult generate(Model & model,
     (void)Vfull;
     (void)t_total;
     return result;
+}
+
+EncodedReference encode_reference(Model & model, std::vector<float> wav,
+                                  bool normalize) {
+    if (!model.codec_loaded()) {
+        throw std::runtime_error("encode_reference: codec is not loaded");
+    }
+    const auto & d = model.dims();
+    if (d.arch == Arch::TTSDelay && normalize) loudness_normalize(wav);
+    EncodedReference out;
+    int32_t nvq_enc = 0;
+    out.codes = codec_encode(model, wav.data(), int64_t(wav.size()),
+                             nvq_enc, out.n_frames);
+    if (nvq_enc != d.n_vq) {
+        throw std::runtime_error("encode_reference: codec_encode returned n_vq=" +
+                                 std::to_string(nvq_enc) + ", expected " +
+                                 std::to_string(d.n_vq));
+    }
+    return out;
 }
 
 } // namespace openmoss
