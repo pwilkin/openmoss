@@ -90,7 +90,11 @@ Usage
 
 Quantization
 ------------
-This script always emits F16 (or whatever you pass via --backbone-dtype). To
+The backbone is emitted in the checkpoint's own dtype — bf16 for the
+Qwen3-based MOSS checkpoints — unless --backbone-dtype overrides it. (f16
+halves the exponent range and is not safe for these backbones:
+MOSS-VoiceGenerator has attention-sink activations far beyond f16's 65504
+max and produces NaN as f16 — see issue #9.) To
 quantize the backbone after conversion, use llama.cpp's `llama-quantize` on the
 output file — the moss.* tensors stay untouched because the quantizer only
 recognises Qwen3 tensor names.
@@ -1100,8 +1104,11 @@ def main():
                     help="HF cache dir (defaults to ~/.cache/huggingface)")
     ap.add_argument("--scratch-dir", default=None,
                     help="Temp dir for the extracted Qwen3 backbone (default: a tempdir)")
-    ap.add_argument("--backbone-dtype", default="f16", choices=["f16", "f32", "bf16"],
-                    help="Output dtype for the backbone (default: f16)")
+    ap.add_argument("--backbone-dtype", default=None, choices=["f16", "f32", "bf16"],
+                    help="Output dtype for the backbone (default: follow the "
+                         "checkpoint's torch_dtype — bf16 for the Qwen3-based "
+                         "MOSS checkpoints; f16 only when the checkpoint itself "
+                         "is float16/float32)")
     ap.add_argument("--sidecar-dtype", default="f16", choices=["f16", "q8_0"],
                     help="Storage for the sidecar's large projection matrices "
                          "(default: f16). q8_0 halves the MOSS-SoundEffect DiT; "
@@ -1163,6 +1170,30 @@ def main():
                     extract_qwen3_backbone(moss_dir, qwen3_dir, fam, moss_config)
 
                 log.info("=== stage 2: convert backbone to GGUF (via llama.cpp) ===")
+                src_dtype = ""
+                try:
+                    with (qwen3_dir / "config.json").open() as f:
+                        src_dtype = str(json.load(f).get("torch_dtype") or "")
+                except OSError:
+                    pass
+                if args.backbone_dtype is None:
+                    # Follow the checkpoint. f16 halves the exponent range and
+                    # is not safe for these Qwen3 backbones: MOSS-VoiceGenerator
+                    # has attention-sink activations up to ~169k — far beyond
+                    # f16's 65504 max — and produces NaN from position 0 when
+                    # converted to f16 (issue #9). bf16 keeps f32's exponent
+                    # range at f16's size.
+                    args.backbone_dtype = (
+                        "f16" if src_dtype in ("float16", "float32") else "bf16")
+                    log.info("backbone dtype: %s (checkpoint torch_dtype: %s; "
+                             "--backbone-dtype overrides)",
+                             args.backbone_dtype, src_dtype or "unset")
+                elif args.backbone_dtype == "f16" and src_dtype == "bfloat16":
+                    log.warning(
+                        "converting a bfloat16 backbone to f16 halves its "
+                        "exponent range; MOSS-VoiceGenerator is known to produce "
+                        "NaN this way (attention sinks ~169k > f16 max 65504 — "
+                        "issue #9). Consider --backbone-dtype bf16.")
                 run_llama_cpp_converter(qwen3_dir, backbone_gguf,
                                         Path(args.llama_cpp_dir), args.backbone_dtype)
                 # The extracted safetensors are dead weight once the GGUF exists,
