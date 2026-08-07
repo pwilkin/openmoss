@@ -572,7 +572,7 @@ GenerateResult generate(Model & model,
         auto t_enc = clock_t_::now();
         int32_t nvq_enc = 0;
         std::vector<float> main_ref = *req.reference_wav;
-        if (d.arch == Arch::TTSDelay && req.normalize_reference) loudness_normalize(main_ref);
+        if (req.normalize_reference) loudness_normalize(main_ref);
         ref_codes = codec_encode(model,
                                   main_ref.data(),
                                   int64_t(main_ref.size()),
@@ -898,7 +898,7 @@ EncodedReference encode_reference(Model & model, std::vector<float> wav,
         throw std::runtime_error("encode_reference: codec is not loaded");
     }
     const auto & d = model.dims();
-    if (d.arch == Arch::TTSDelay && normalize) loudness_normalize(wav);
+    if (normalize) loudness_normalize(wav);
     EncodedReference out;
     int32_t nvq_enc = 0;
     out.codes = codec_encode(model, wav.data(), int64_t(wav.size()),

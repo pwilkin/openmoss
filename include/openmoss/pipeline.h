@@ -123,10 +123,10 @@ GenerateResult generate(Model & model,
                         StreamCallback cb = {});
 
 // In-house: encode one reference waveform (channel-interleaved f32 at the
-// model's rate) to codec codes, applying the family's normalization policy
-// (delay family loudness-normalizes to −20 dBFS unless `normalize` is false;
-// moss_tts_local does not normalize, matching generate()). This is the same
-// path generate() takes internally — cache the result and pass it via
+// model's rate) to codec codes, loudness-normalizing it to −20 dBFS first
+// unless `normalize` is false — every family's processor does this to
+// reference audio before handing it to the tokenizer. This is the same path
+// generate() takes internally — cache the result and pass it via
 // GenerateRequest::reference_codes to skip the encode on later requests.
 EncodedReference encode_reference(Model & model, std::vector<float> wav,
                                   bool normalize = true);
