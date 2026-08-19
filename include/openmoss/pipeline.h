@@ -71,7 +71,14 @@ struct GenerateRequest {
     // the references and the delay ramp lands inside the prefix. The prefix
     // audio is trimmed from the output waveform. Delay family only — this is
     // the in-house feature upstream's STATUS.md lists as "not done".
-    bool                              continuation_prefix = true;
+    //
+    // Unset resolves per checkpoint: on for n_vq<32 (verified against
+    // MOSS-TTSD), off for the flagship MOSS-TTS (n_vq>=32), where the prefix
+    // stops the model following its text and emitting end-of-speech — the
+    // delay family takes no reference transcript, so nothing in the text
+    // channel accounts for the audio it is told it already spoke. See
+    // d9c3c93. Set explicitly to override either way.
+    std::optional<bool>               continuation_prefix;
     // Loudness-normalize each reference to −20 dBFS before encoding, as
     // upstream's processor does (processing_moss_tts.py:767-779).
     bool                              normalize_reference = true;

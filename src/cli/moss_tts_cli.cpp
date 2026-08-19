@@ -30,7 +30,7 @@ struct Args {
     // template that goes with the loaded checkpoint (delay family only).
     std::vector<std::string>   speaker_refs;
     std::string                template_name = "auto";
-    bool                       no_prefix = false;
+    std::optional<bool>        continuation_prefix;
     std::optional<std::string> instruction;
     std::optional<std::string> language;
     std::optional<int> tokens;
@@ -89,11 +89,13 @@ struct Args {
         "                         checkpoints are indistinguishable from the GGUF, so\n"
         "                         auto assumes voicegen and says so — pass\n"
         "                         --template ttsd when running MOSS-TTSD.\n"
-        "  --no-continuation-prefix\n"
-        "                         Do not splice the reference audio behind the\n"
-        "                         assistant's audio_start. The model then re-speaks\n"
-        "                         the text from scratch — needed when the synthesis\n"
-        "                         text IS the reference transcript (identity A/B).\n"
+        "  --continuation-prefix / --no-continuation-prefix\n"
+        "                         Splice the reference audio behind the assistant's\n"
+        "                         audio_start so the model does not re-speak the\n"
+        "                         transcripts. Default is per checkpoint: on for\n"
+        "                         n_vq<32, off for the flagship MOSS-TTS (n_vq>=32),\n"
+        "                         where it makes the model stop following its text\n"
+        "                         and never emit end-of-speech.\n"
         "  --instruction STRING   Voice/style description (voice generation mode)\n"
         "  --language CODE        Language code hint (en/zh/...)\n"
         "  --tokens N             Approximate audio token count (1s ≈ 12.5 tokens)\n"
@@ -202,7 +204,8 @@ int main(int argc, char ** argv) {
         else if (k == "--reference")       a.reference   = require_str(i, argc, argv);
         else if (k == "--speaker-ref")     a.speaker_refs.push_back(require_str(i, argc, argv));
         else if (k == "--template")        a.template_name = require_str(i, argc, argv);
-        else if (k == "--no-continuation-prefix") a.no_prefix = true;
+        else if (k == "--continuation-prefix")    a.continuation_prefix = true;
+        else if (k == "--no-continuation-prefix") a.continuation_prefix = false;
         else if (k == "--instruction")     a.instruction = require_str(i, argc, argv);
         else if (k == "--language")        a.language    = require_str(i, argc, argv);
         else if (k == "--tokens")          a.tokens      = require_int(i, argc, argv);
@@ -431,7 +434,7 @@ int main(int argc, char ** argv) {
         }
         req.reference_wav = std::move(concat);
     }
-    if (a.no_prefix) req.continuation_prefix = false;
+    if (a.continuation_prefix) req.continuation_prefix = *a.continuation_prefix;
     if (dims.arch == openmoss::Arch::TTSDelay) {
         std::fprintf(stderr,
                      "[cli] template=%s sampling: temp=%.2f top_p=%.2f top_k=%d rep_pen=%.2f "

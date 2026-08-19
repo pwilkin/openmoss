@@ -513,6 +513,9 @@ GenerateResult generate(Model & model,
     std::vector<std::string>          reference_blocks;
     std::vector<int32_t>              prefix_codes;
     int32_t                           T_prefix = 0;
+    // Per-checkpoint default; see GenerateRequest::continuation_prefix.
+    const bool use_continuation_prefix =
+        req.continuation_prefix.value_or(n_vq < 32);
     if (!req.reference_codes.empty()) {
         // Pre-encoded references from a caching caller (the server's voice
         // registry): the same layouts the wav path below produces, minus the
@@ -534,7 +537,7 @@ GenerateResult generate(Model & model,
                 std::fprintf(stderr, "[generate] reference [S%zu]: %d frames (cached codes)\n",
                              i + 1, r.n_frames);
             }
-            if (req.continuation_prefix) {
+            if (use_continuation_prefix) {
                 // Frame-wise concatenation per codebook row. Unlike the wav
                 // path — which re-encodes the concatenated waveform — this
                 // keeps the prefix identical to the [S{i}] block codes.
@@ -615,7 +618,7 @@ GenerateResult generate(Model & model,
             // Assistant prefix: the codes of `reference_wav` — by contract the
             // concatenation of all speakers (or the single reference), already
             // normalized and encoded above.
-            if (req.continuation_prefix) {
+            if (use_continuation_prefix) {
                 prefix_codes = ref_codes;
                 T_prefix     = T_ref;
                 std::fprintf(stderr, "[generate] assistant continuation prefix: %d frames\n", T_prefix);

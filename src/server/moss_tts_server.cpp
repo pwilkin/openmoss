@@ -49,7 +49,10 @@
 //                                     //   `text`, as "[S1] <transcript1> [S2]
 //                                     //   <transcript2> [S1] <turn> …", per the
 //                                     //   MOSS-TTSD prompt format.
-//     "continuation_prefix": bool,    // default true. Delay family with
+//     "continuation_prefix": bool,    // default: per checkpoint — on for
+//                                     //   n_vq<32, OFF for the flagship MOSS-TTS
+//                                     //   (n_vq>=32), where it stops the model
+//                                     //   following its text. Delay family with
 //                                     //   references only: splice the reference
 //                                     //   audio behind the assistant's
 //                                     //   audio_start so the model does not
@@ -726,7 +729,9 @@ int main(int argc, char ** argv) {
     // truncated stream. Catch the combination while a 400 is still possible.
     auto stream_prefix_error = [&](const openmoss::GenerateRequest & req,
                                    bool want_stream) -> const char * {
-        if (want_stream && delay_arch && req.continuation_prefix &&
+        const bool prefix_on =
+            req.continuation_prefix.value_or(model->dims().n_vq < 32);
+        if (want_stream && delay_arch && prefix_on &&
             (req.reference_wav || !req.reference_wavs.empty() ||
              !req.reference_codes.empty())) {
             return "streaming is not supported together with the continuation "
@@ -1321,8 +1326,10 @@ int main(int argc, char ** argv) {
         req.stream_chunk_frames =
             std::max(1, jget(body, "stream_chunk_frames", req.stream_chunk_frames));
         if (ttsd_mode) req.prompt_template = openmoss::PromptTemplate::TTSD;
-        req.continuation_prefix = jget(body, "continuation_prefix",
-                                       req.continuation_prefix);
+        if (auto it = body.find("continuation_prefix");
+            it != body.end() && !it->is_null()) {
+            req.continuation_prefix = it->get<bool>();
+        }
         req.sampling        = parse_sampling(body.value("sampling", json::object()),
                                              base_sampling);
         finalize_voicegen_request(req, voicegen_mode);
@@ -1512,8 +1519,10 @@ int main(int argc, char ** argv) {
         // flattened at the top level, which is what the cookbooks send. The
         // nested form is applied first so explicit flat keys win.
         if (ttsd_mode) req.prompt_template = openmoss::PromptTemplate::TTSD;
-        req.continuation_prefix = jget(body, "continuation_prefix",
-                                       req.continuation_prefix);
+        if (auto it = body.find("continuation_prefix");
+            it != body.end() && !it->is_null()) {
+            req.continuation_prefix = it->get<bool>();
+        }
         req.sampling       = parse_sampling(body.value("sampling", json::object()),
                                             base_sampling);
         req.sampling       = parse_sampling(body, req.sampling);
