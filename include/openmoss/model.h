@@ -168,6 +168,14 @@ struct LoadOptions {
     // op the codec needs (e.g. llama.cpp Metal lacks DIAG_MASK_INF). The
     // backbone still uses the GPU via libllama. Default: follow main_gpu.
     bool    aux_cpu      = false;
+
+    // In-house: keep the KV cache in f32 instead of libllama's f16 default.
+    // MOSS-VoiceGenerator's Qwen3-1.7B backbone pushes attention-sink
+    // activations at position 0 beyond f16's 65504 max; the V row saturates to
+    // inf in the cache and every layer after reads NaN — measured as a NaN
+    // hidden state for any prefix on this model, while PyTorch (f32 KV) is
+    // finite. The 8B TTSD backbone stays inside f16 range and is unaffected.
+    bool    kv_f32       = false;
 };
 
 // Forward decl; implemented in model.cpp.

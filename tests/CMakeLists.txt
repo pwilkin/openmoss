@@ -27,3 +27,6 @@ target_link_libraries(moss-codec-causality PRIVATE openmoss_core)
 
 add_executable(moss-codec-stream ${CMAKE_CURRENT_SOURCE_DIR}/moss_codec_stream.cpp)
 target_link_libraries(moss-codec-stream PRIVATE openmoss_core)
+
+add_executable(moss-hidden-probe ${CMAKE_CURRENT_SOURCE_DIR}/moss_hidden_probe.cpp)
+target_link_libraries(moss-hidden-probe PRIVATE openmoss_core)

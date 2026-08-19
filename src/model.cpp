@@ -457,6 +457,12 @@ std::unique_ptr<Model> Model::load(const std::string & gguf_path, const LoadOpti
     // so every token's hidden state is retrievable via llama_get_embeddings_ith.
     cp.pooling_type    = LLAMA_POOLING_TYPE_NONE;
     cp.flash_attn_type = opts.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    if (opts.kv_f32) {
+        // See LoadOptions::kv_f32 — f16 V rows saturate on MOSS-VoiceGenerator's
+        // position-0 attention-sink activations and poison the whole forward.
+        cp.type_k = GGML_TYPE_F32;
+        cp.type_v = GGML_TYPE_F32;
+    }
     self->m_backbone_ctx = llama_init_from_model(self->m_backbone_model, cp);
     if (!self->m_backbone_ctx) {
         llama_model_free(self->m_backbone_model);
