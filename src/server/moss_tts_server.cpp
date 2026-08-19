@@ -315,7 +315,11 @@ json voice_meta_json(const std::string & id, const VoiceMeta & m) {
 std::string iso8601_now() {
     std::time_t t = std::time(nullptr);
     std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &t);
+#else
     gmtime_r(&t, &tm);
+#endif
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return std::string(buf);
