@@ -36,6 +36,28 @@ Prebuilt binaries for Linux and Windows (Vulkan, ROCm, CUDA) are published on th
 against, so no separate llama.cpp build is needed. Serves as the `openmoss` backend of
 [Lemonade](https://github.com/lemonade-sdk/lemonade).
 
+## What's new in 0.3.0
+
+This release makes voice cloning practical for production use and preserves model precision
+through conversion.
+
+**Voice cloning and continuation**
+
+- The flagship delay-pattern MOSS-TTS models now support **multi-speaker reference audio** and
+  continuation, including checkpoint-derived chat templates and sampling defaults.
+- The server has a **voice registry**: references can be registered once and reused by name.
+  Their encoded audio codes are cached, avoiding repeated codec-encoder work on every request.
+- Reference audio is loudness-normalized consistently for both delay-pattern and
+  Local-Transformer models.
+- Continuation prompting is now opt-in for the flagship MOSS-TTS model, matching the model's
+  intended cloning behavior instead of silently prefixing every generation.
+
+**Conversion and portability**
+
+- Conversion follows each checkpoint's `torch_dtype`, preserving BF16 backbones without an
+  intermediate FP16 cast.
+- The server uses a Windows-safe UTC conversion path.
+
 ## What's new in 0.2.0
 
 Two entire model families and streaming, on top of what 0.1.x shipped for MOSS-TTS-Delay.
