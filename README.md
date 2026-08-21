@@ -63,6 +63,9 @@ audio from 2.54 s to 0.57 s on a 4.8 s utterance. See [`docs/STREAMING.md`](docs
   between the native and OpenAI-compatible routes.
 - **WebUI**: a MOSS-SoundEffect mode.
 - **Q8\_0 sidecar quantization** for the projection matrices (`--sidecar-dtype q8_0`).
+- **BF16-preserving conversion** for backbones and sidecars. Ordinary learned weights default to
+  BF16 without an intermediate FP16 cast; normalization vectors, SFX Snake reciprocals, and the
+  v1 codec's float32 residual quantizer remain FP32.
 - `--min-audio-frames` / `--max-audio-frames` to bound a segment when a model will not stop.
 
 **Fixes worth knowing about**
@@ -85,15 +88,15 @@ cmake --build build -j
 
 # 2. Convert weights once (or download a pre-built GGUF — see "Convert weights")
 python scripts/convert_hf_to_gguf.py \
-    --moss-tts OpenMOSS-Team/MOSS-TTS \
+    --moss-tts OpenMOSS-Team/MOSS-TTS-v1.5 \
     --codec    OpenMOSS-Team/MOSS-Audio-Tokenizer \
     --output   weights/moss-tts.gguf
 
-# 3. (Optional) quantize the backbone — keep the embedding table as f16.
+# 3. (Optional) quantize the backbone — keep the embedding table as bf16.
 #    llama-quantize comes from any llama.cpp build/release (the in-tree
 #    submodule build skips llama.cpp's tools).
 llama-quantize \
-    --token-embedding-type f16 \
+    --token-embedding-type bf16 \
     weights/moss-tts.gguf weights/moss-tts-q8_0.gguf Q8_0
 
 # 4. Synthesize
@@ -182,7 +185,7 @@ pip install safetensors numpy huggingface_hub gguf
 
 # MOSS-TTS (delay family)
 python scripts/convert_hf_to_gguf.py \
-    --moss-tts OpenMOSS-Team/MOSS-TTS \
+    --moss-tts OpenMOSS-Team/MOSS-TTS-v1.5 \
     --codec    OpenMOSS-Team/MOSS-Audio-Tokenizer \
     --output   weights/moss-tts.gguf
 
@@ -201,27 +204,27 @@ python scripts/convert_hf_to_gguf.py \
 | flag | meaning |
 |---|---|
 | `--arch ID` | force the family instead of detecting it from `config.json` |
-| `--backbone-dtype f16\|f32\|bf16` | backbone precision (default f16) |
-| `--sidecar-dtype f16\|q8_0` | quantize the sidecar's projection matrices (default f16) |
+| `--backbone-dtype f16\|f32\|bf16` | backbone precision (default follows source; float32 sources are promoted to bf16) |
+| `--sidecar-dtype f16\|bf16\|q8_0` | sidecar storage (default bf16; sensitive tensors stay f32) |
 | `--sidecar-only` | rewrite just the sidecar, reusing an existing backbone |
 | `--llama-cpp-dir DIR` | a different llama.cpp source tree; defaults to the bundled submodule (no llama.cpp *build* required) |
 | `--cache-dir` / `--scratch-dir` / `--keep-scratch` / `--skip-extract` | HF cache location, and reusing or inspecting the intermediate extracted backbone |
 
 **Do not quantize the MOSS-SoundEffect backbone.** It is a text *encoder* whose hidden states are
 consumed as a continuous conditioning vector, so there is no sampling stage to absorb the error:
-Q8\_0 moves the conditioning to 2.7e-2 and the final latent to 1.8e-1. f16 against the source
-bf16 is not a compromise — the measured round-trip across 2.03 B weights is 4.7e-9.
+Q8\_0 moves the conditioning to 2.7e-2 and the final latent to 1.8e-1. Keep this backbone BF16,
+matching the reference pipeline's CUDA dtype.
 
 ### Quantization
 
 Quantize the backbone the same way you quantize any GGUF, but pass
-`--token-embedding-type f16`: the embedding table is indexed via `ggml_get_rows`, which doesn't
-support quantized `src0` on CUDA, so it must stay f16.
+`--token-embedding-type bf16`: the embedding table is indexed via `ggml_get_rows`, so it must stay
+unquantized; BF16 avoids reintroducing the FP16 exponent-range problem.
 
 ```bash
-llama-quantize --token-embedding-type f16 \
+llama-quantize --token-embedding-type bf16 \
     weights/moss-tts.gguf weights/moss-tts-q8_0.gguf Q8_0   # ~8.7 GB, validated end-to-end
-llama-quantize --token-embedding-type f16 \
+llama-quantize --token-embedding-type bf16 \
     weights/moss-tts.gguf weights/moss-tts-q4km.gguf Q4_K_M # ~4.7 GB
 ```
 

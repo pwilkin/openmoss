@@ -231,23 +231,30 @@ class STShard:
         finally:
             mv.release()
 
-    def get_f16(self, tname: str) -> "np.ndarray":
-        """Read a tensor and return it as a numpy float16 array.
+    def get_f32(self, tname: str) -> "np.ndarray":
+        """Read a floating tensor without an intermediate f16 cast.
 
-        Handles bf16 via bit-shift; passes through f16; casts other floats.
+        Numpy has no native bfloat16 dtype, so BF16 values are expanded to
+        float32. The GGUF writer later rounds that representation to the
+        requested storage type. This avoids BF16 -> F16 -> BF16, which loses
+        BF16's exponent range before the final file is written.
         """
         raw, dtype, shape = self.read_raw(tname)
         if dtype == "F16":
-            return np.frombuffer(raw, dtype=np.float16).reshape(shape).copy()
+            return np.frombuffer(raw, dtype=np.float16).reshape(shape).astype(np.float32)
         if dtype == "BF16":
             u16 = np.frombuffer(raw, dtype=np.uint16)
             f32 = (u16.astype(np.uint32) << 16).view(np.float32)
-            return f32.astype(np.float16).reshape(shape)
+            return f32.reshape(shape)
         if dtype == "F32":
-            return np.frombuffer(raw, dtype=np.float32).reshape(shape).astype(np.float16)
+            return np.frombuffer(raw, dtype=np.float32).reshape(shape).copy()
         if dtype == "F64":
-            return np.frombuffer(raw, dtype=np.float64).reshape(shape).astype(np.float16)
+            return np.frombuffer(raw, dtype=np.float64).reshape(shape).astype(np.float32)
         raise RuntimeError(f"unhandled tensor dtype {dtype} for {tname} ({self.path})")
+
+    def get_f16(self, tname: str) -> "np.ndarray":
+        """Compatibility helper for callers that explicitly request f16."""
+        return self.get_f32(tname).astype(np.float16)
 
     def get_native(self, tname: str) -> "np.ndarray":
         """Read a tensor in its source dtype where numpy can represent it.
@@ -487,23 +494,23 @@ def _shards_by_name(model_dir: Path) -> dict[str, list[str]]:
 
 
 def collect_audio_extras_delay(moss_dir: Path, cfg: dict):
-    """Yield (gguf_tensor_name, np.ndarray[f16]) for the audio embeddings + heads."""
+    """Yield float32 staging arrays for the audio embeddings and heads."""
     by_shard = _shards_by_name(moss_dir)
     for shard in sorted(by_shard):
         with STShard(moss_dir / shard) as sf:
             for tname in sorted(by_shard[shard]):
                 if tname.startswith("emb_ext.") and tname.endswith(".weight"):
                     idx = int(tname.split(".")[1])
-                    yield f"moss.audio_embed.{idx}.weight", sf.get_f16(tname)
+                    yield f"moss.audio_embed.{idx}.weight", sf.get_f32(tname)
                 elif tname.startswith("lm_heads.") and tname.endswith(".weight"):
                     idx = int(tname.split(".")[1])
                     if idx == 0:
                         continue # already mapped to output.weight by stage 1
-                    yield f"moss.audio_head.{idx-1}.weight", sf.get_f16(tname)
+                    yield f"moss.audio_head.{idx-1}.weight", sf.get_f32(tname)
 
 
 def collect_audio_extras_local(moss_dir: Path, cfg: dict):
-    """Yield (gguf_tensor_name, np.ndarray[f16]) for MOSS-TTS-Local.
+    """Yield float32 staging arrays for MOSS-TTS-Local.
 
     Three differences from the delay family:
 
@@ -534,11 +541,11 @@ def collect_audio_extras_local(moss_dir: Path, cfg: dict):
             for tname in sorted(by_shard[shard]):
                 if tname.startswith("audio_embeddings.") and tname.endswith(".weight"):
                     idx = int(tname.split(".")[1])
-                    arr = sf.get_f16(tname)          # (audio_vocab, hidden)
+                    arr = sf.get_f32(tname)          # (audio_vocab, hidden)
                     if arr.shape[0] != audio_vocab:
                         raise RuntimeError(
                             f"{tname}: expected {audio_vocab} rows, got {arr.shape[0]}")
-                    padded = np.zeros((audio_vocab + 1, arr.shape[1]), dtype=np.float16)
+                    padded = np.zeros((audio_vocab + 1, arr.shape[1]), dtype=np.float32)
                     padded[:audio_vocab] = arr
                     yield f"moss.audio_embed.{idx}.weight", padded
                 elif tname.startswith("audio_lm_heads."):
@@ -546,9 +553,9 @@ def collect_audio_extras_local(moss_dir: Path, cfg: dict):
                 elif tname == "text_lm_head.weight":
                     continue                          # tied to transformer.embed_tokens
                 elif tname.startswith("local_transformer."):
-                    yield "moss.local." + tname[len("local_transformer."):], sf.get_f16(tname)
+                    yield "moss.local." + tname[len("local_transformer."):], sf.get_f32(tname)
                 elif tname == "local_text_lm_head.weight":
-                    yield "moss.local_text_head.weight", sf.get_f16(tname)
+                    yield "moss.local_text_head.weight", sf.get_f32(tname)
 
 
 _CODEC_RENAMES = (
@@ -617,7 +624,7 @@ def collect_codec_tensors(codec_dir: Path):
             for tname in sorted(by_shard[shard]):
                 src_dtype = sf.dtype_of(tname)
                 if src_dtype in ("F16", "BF16", "F32", "F64"):
-                    arr = sf.get_f16(tname)
+                    arr = sf.get_f32(tname)
                 else:
                     arr = sf.get_native(tname)
                 short = "moss.codec." + _shorten_codec_name(tname)
@@ -664,7 +671,7 @@ def collect_soundeffect_extras(moss_dir: Path, cfg: dict):
     dit_dir = moss_dir / "transformer"
     with STShard(dit_dir / "diffusion_pytorch_model.safetensors") as sf:
         for t in sorted(sf.keys()):
-            arr = sf.get_f16(t)
+            arr = sf.get_f32(t)
             n = t
             n = n.replace("condition_embedder.time_embedder.linear_", "t_emb.")
             n = n.replace("condition_embedder.time_proj",             "t_proj")
@@ -698,8 +705,8 @@ def collect_soundeffect_extras(moss_dir: Path, cfg: dict):
     def emit_conv(prefix, key):
         """A weight-normed conv: fold g/v, pass the bias through."""
         g, v = sd[key + ".weight_g"], sd[key + ".weight_v"]
-        yield prefix + ".weight", _fold_weight_norm(g, v).astype(np.float16)
-        yield prefix + ".bias",   sd[key + ".bias"].astype(np.float16)
+        yield prefix + ".weight", _fold_weight_norm(g, v)
+        yield prefix + ".bias",   sd[key + ".bias"].astype(np.float32)
 
     def emit_snake(prefix, key):
         """Snake: y = x + sin(a*x)^2 / (a + 1e-9).
@@ -712,8 +719,8 @@ def collect_soundeffect_extras(moss_dir: Path, cfg: dict):
         yield prefix + ".alpha", a.astype(np.float32)
         yield prefix + ".inv",   (1.0 / (a + 1e-9)).astype(np.float32)
 
-    yield "moss.vae.post_quant.weight", sd["post_quant_conv.weight"].astype(np.float16)
-    yield "moss.vae.post_quant.bias",   sd["post_quant_conv.bias"].astype(np.float16)
+    yield "moss.vae.post_quant.weight", sd["post_quant_conv.weight"].astype(np.float32)
+    yield "moss.vae.post_quant.bias",   sd["post_quant_conv.bias"].astype(np.float32)
 
     for name, arr in emit_conv("moss.vae.dec.in", "decoder.model.0"):
         yield name, arr
@@ -809,26 +816,77 @@ _QUANTISABLE_SIDECAR = re.compile(
     r"\.weight$")
 
 
-def resolve_sidecar_quant(spec: str | None):
-    """Map a --sidecar-dtype string to a GGMLQuantizationType, or None for f16."""
-    if not spec or spec == "f16":
-        return None
-    from gguf import GGMLQuantizationType
-    try:
-        return getattr(GGMLQuantizationType, spec.upper())
-    except AttributeError:
-        raise SystemExit(f"--sidecar-dtype {spec!r} is not a known GGML type")
+def resolve_sidecar_dtype(spec: str | None) -> str:
+    """Validate and normalize the sidecar storage policy."""
+    spec = spec or "bf16"
+    if spec not in {"f16", "bf16", "q8_0"}:
+        raise SystemExit(f"--sidecar-dtype {spec!r} is not supported")
+    return spec
 
 
-def _sidecar_quant_type(name: str, arr: "np.ndarray", quant):
-    """The GGML type to store `name` as, or None to keep it f16/f32."""
-    if quant is None or not _QUANTISABLE_SIDECAR.match(name):
+def _sidecar_quant_type(name: str, arr: "np.ndarray", storage: str):
+    """The block-quantized GGML type for `name`, if requested and eligible."""
+    if storage != "q8_0" or not _QUANTISABLE_SIDECAR.match(name):
         return None
     # Block quantisation runs along the first ggml axis, which is the *last*
     # numpy axis (gguf reverses the shape on write).
     if arr.ndim != 2 or arr.shape[-1] % 32 != 0:
         return None
-    return quant
+    from gguf import GGMLQuantizationType
+    return GGMLQuantizationType.Q8_0
+
+
+def _sidecar_must_stay_f32(name: str, arr: "np.ndarray") -> bool:
+    """Return whether reduced-precision storage would violate reference math.
+
+    The v1 audio tokenizer performs residual vector quantization and codebook
+    accumulation explicitly in float32. SFX Snake reciprocals can exceed the
+    finite range of float16. As in llama.cpp's MOSTLY_BF16 conversion, 1-D
+    normalization, scale, and bias tensors remain float32.
+    """
+    return (
+        arr.dtype == np.float32
+        and (
+            arr.ndim <= 1
+            or name.startswith("moss.codec.quantizer.")
+            or (name.startswith("moss.vae.") and name.endswith((".alpha", ".inv")))
+        )
+    )
+
+
+def _add_sidecar_tensor(writer, name: str, arr: "np.ndarray", storage: str) -> str:
+    """Write one sidecar tensor and return its effective GGML type name."""
+    if not np.issubdtype(arr.dtype, np.floating):
+        writer.add_tensor(name, arr)
+        return str(arr.dtype)
+
+    arr = arr.astype(np.float32, copy=False)
+    if _sidecar_must_stay_f32(name, arr):
+        writer.add_tensor(name, arr)
+        return "F32"
+
+    qtype = _sidecar_quant_type(name, arr, storage)
+    if qtype is not None:
+        from gguf import quants
+        writer.add_tensor(name, quants.quantize(arr, qtype), raw_dtype=qtype)
+        return qtype.name
+
+    if storage == "bf16":
+        from gguf import GGMLQuantizationType, quants
+        qtype = GGMLQuantizationType.BF16
+        writer.add_tensor(name, quants.quantize(arr, qtype), raw_dtype=qtype)
+        return qtype.name
+
+    if storage == "q8_0":
+        # q8_0 applies only to eligible SFX DiT matrices. Keep the sensitive
+        # and structurally ineligible remainder in BF16, never F16.
+        from gguf import GGMLQuantizationType, quants
+        qtype = GGMLQuantizationType.BF16
+        writer.add_tensor(name, quants.quantize(arr, qtype), raw_dtype=qtype)
+        return qtype.name
+
+    writer.add_tensor(name, arr.astype(np.float16))
+    return "F16"
 
 
 class Family:
@@ -916,7 +974,7 @@ def write_moss_sidecar(out_gguf: Path,
                        codec_dir: Path | None,
                        fam: Family,
                        llama_cpp_dir: Path | None = None,
-                       sidecar_quant=None) -> None:
+                       sidecar_dtype: str = "bf16") -> None:
     """Write the MOSS extras (audio embeddings, family-specific heads, optional
     codec, plus the moss.* KV namespace) into a sidecar GGUF.
 
@@ -929,6 +987,12 @@ def write_moss_sidecar(out_gguf: Path,
     import gguf
 
     writer = gguf.GGUFWriter(str(out_gguf), fam.arch)
+    writer.add_quantization_version(2)
+    writer.add_file_type({
+        "f16": gguf.LlamaFileType.MOSTLY_F16,
+        "bf16": gguf.LlamaFileType.MOSTLY_BF16,
+        "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
+    }[sidecar_dtype])
 
     # ── 1. emit MOSS KV ─────────────────────────────────────────────────────
     n_vq             = int(moss_config.get("n_vq", fam.n_vq))
@@ -1002,32 +1066,22 @@ def write_moss_sidecar(out_gguf: Path,
 
     # ── 2. add MOSS audio tensors ──────────────────────────────────────────
     #
-    # f16 is the default, but a collector that deliberately produced f32 keeps
-    # it. That matters: MOSS-SoundEffect's Snake activation ships a precomputed
+    # BF16 is the default. Numerically sensitive tensors deliberately stay f32.
+    # That matters: MOSS-SoundEffect's Snake activation ships a precomputed
     # 1/(alpha + 1e-9), and three of those reciprocals exceed f16's 65504 ceiling
     # (alpha gets as small as 8.3e-6, giving 1.2e5). Rounding them to inf would
     # feed inf into the decoder and corrupt the waveform silently.
     audio_count = 0
-    quant_count = 0
+    type_counts: dict[str, int] = defaultdict(int)
     n_audio_embed = 0
     for name, arr in fam.collect_extras(moss_dir, moss_config):
         if name.startswith("moss.audio_embed."):
             n_audio_embed += 1
-        qtype = _sidecar_quant_type(name, arr, sidecar_quant)
-        if qtype is not None:
-            from gguf import quants
-            # No raw_shape: gguf treats that argument as a *byte* shape and
-            # derives the logical one from it, which is exactly what the
-            # quantized array's own shape already is.
-            writer.add_tensor(name, quants.quantize(arr.astype(np.float32), qtype),
-                              raw_dtype=qtype)
-            quant_count += 1
-        else:
-            writer.add_tensor(name, arr if arr.dtype == np.float32
-                                    else arr.astype(np.float16))
+        effective = _add_sidecar_tensor(writer, name, arr, sidecar_dtype)
+        type_counts[effective] += 1
         audio_count += 1
-    log.info("added %d MOSS audio/head tensors (%d quantised to %s)",
-             audio_count, quant_count, sidecar_quant.name if sidecar_quant else "none")
+    log.info("added %d MOSS audio/head tensors (%s)",
+             audio_count, ", ".join(f"{k}={v}" for k, v in sorted(type_counts.items())))
 
     # Cross-check the n_vq we wrote against what the checkpoint actually carried.
     #
@@ -1053,9 +1107,12 @@ def write_moss_sidecar(out_gguf: Path,
     if codec_dir is not None:
         codec_count = 0
         for name, arr in collect_codec_tensors(codec_dir):
-            writer.add_tensor(name, arr.astype(np.float16))
+            effective = _add_sidecar_tensor(writer, name, arr, sidecar_dtype)
+            type_counts[effective] += 1
             codec_count += 1
-        log.info("added %d codec tensors", codec_count)
+        log.info("added %d codec tensors; complete sidecar inventory: %s",
+                 codec_count,
+                 ", ".join(f"{k}={v}" for k, v in sorted(type_counts.items())))
 
     # ── 4. flush ───────────────────────────────────────────────────────────
     log.info("writing sidecar %s", out_gguf)
@@ -1106,14 +1163,13 @@ def main():
                     help="Temp dir for the extracted Qwen3 backbone (default: a tempdir)")
     ap.add_argument("--backbone-dtype", default=None, choices=["f16", "f32", "bf16"],
                     help="Output dtype for the backbone (default: follow the "
-                         "checkpoint's torch_dtype — bf16 for the Qwen3-based "
-                         "MOSS checkpoints; f16 only when the checkpoint itself "
-                         "is float16/float32)")
-    ap.add_argument("--sidecar-dtype", default="f16", choices=["f16", "q8_0"],
-                    help="Storage for the sidecar's large projection matrices "
-                         "(default: f16). q8_0 halves the MOSS-SoundEffect DiT; "
-                         "the modulation path, the head and the VAE always stay "
-                         "f16/f32 regardless")
+                         "checkpoint's torch_dtype, promoting float32 sources "
+                         "to bf16; f16 is used only for a float16 source)")
+    ap.add_argument("--sidecar-dtype", default="bf16", choices=["f16", "bf16", "q8_0"],
+                    help="Storage for ordinary sidecar weights (default: bf16). "
+                         "Numerically sensitive tensors remain f32. q8_0 quantizes "
+                         "eligible MOSS-SoundEffect DiT matrices and keeps the "
+                         "remaining ordinary weights bf16")
     ap.add_argument("--keep-scratch", action="store_true",
                     help="Don't delete the scratch dir after conversion")
     ap.add_argument("--skip-extract", action="store_true",
@@ -1183,8 +1239,7 @@ def main():
                     # f16's 65504 max — and produces NaN from position 0 when
                     # converted to f16 (issue #9). bf16 keeps f32's exponent
                     # range at f16's size.
-                    args.backbone_dtype = (
-                        "f16" if src_dtype in ("float16", "float32") else "bf16")
+                    args.backbone_dtype = "f16" if src_dtype == "float16" else "bf16"
                     log.info("backbone dtype: %s (checkpoint torch_dtype: %s; "
                              "--backbone-dtype overrides)",
                              args.backbone_dtype, src_dtype or "unset")
@@ -1218,7 +1273,7 @@ def main():
         log.info("=== stage 3b: write MOSS sidecar → %s ===", sidecar_path)
         write_moss_sidecar(sidecar_path, moss_config, moss_dir, codec_dir,
                            fam, Path(args.llama_cpp_dir),
-                           sidecar_quant=resolve_sidecar_quant(args.sidecar_dtype))
+                           sidecar_dtype=resolve_sidecar_dtype(args.sidecar_dtype))
     finally:
         if cleanup_scratch:
             shutil.rmtree(scratch, ignore_errors=True)

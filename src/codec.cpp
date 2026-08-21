@@ -31,7 +31,7 @@
 // safetensors carry `wp0` (magnitude, shape (out, 1, 1)) and `wp1` (direction,
 // shape (out, in, 1)) instead of a plain weight. We materialise the effective
 // weight `w[o,i] = wp0[o] * wp1[o,i] / sqrt(Σi wp1[o,i]^2)` on the host once at
-// codec init and upload it as a fresh f16 tensor on the aux backend.
+// codec init and upload it as a fresh f32 tensor on the aux backend.
 
 #include "openmoss/codec.h"
 #include "openmoss/model.h"
@@ -157,62 +157,6 @@ ggml_tensor * mm_(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x) {
     return y;
 }
 
-// f16 representation helpers (we store everything as f16 on the backend).
-inline uint16_t f32_to_f16_bits(float f) {
-    uint32_t u; std::memcpy(&u, &f, 4);
-    uint32_t sign = (u >> 31) & 0x1;
-    int32_t  exp  = int32_t((u >> 23) & 0xff) - 127 + 15;
-    uint32_t mant = u & 0x7fffff;
-    uint16_t out;
-    if (exp <= 0) {
-        // subnormal or zero
-        if (exp < -10) { out = uint16_t(sign << 15); }
-        else {
-            mant = (mant | 0x800000) >> uint32_t(1 - exp);
-            // round to nearest even
-            if (mant & 0x1000) mant += 0x2000;
-            out = uint16_t((sign << 15) | (mant >> 13));
-        }
-    } else if (exp >= 0x1f) {
-        // overflow → inf (or NaN if mantissa)
-        out = uint16_t((sign << 15) | (0x1f << 10) | (mant ? 0x200 : 0));
-    } else {
-        if (mant & 0x1000) {
-            mant += 0x2000;
-            if (mant & 0x800000) { mant = 0; exp += 1; }
-            if (exp >= 0x1f) {
-                out = uint16_t((sign << 15) | (0x1f << 10));
-                return out;
-            }
-        }
-        out = uint16_t((sign << 15) | (uint32_t(exp) << 10) | (mant >> 13));
-    }
-    return out;
-}
-
-inline float f16_bits_to_f32(uint16_t h) {
-    uint32_t sign = uint32_t(h >> 15) & 0x1;
-    int32_t  exp  = int32_t((h >> 10) & 0x1f);
-    uint32_t mant = uint32_t(h & 0x3ff);
-    uint32_t u;
-    if (exp == 0) {
-        if (mant == 0) {
-            u = sign << 31;
-        } else {
-            // subnormal
-            int32_t e = -1;
-            do { e++; mant <<= 1; } while ((mant & 0x400) == 0);
-            mant &= 0x3ff;
-            u = (sign << 31) | (uint32_t(127 - 15 - e) << 23) | (mant << 13);
-        }
-    } else if (exp == 0x1f) {
-        u = (sign << 31) | (0xffu << 23) | (mant << 13);
-    } else {
-        u = (sign << 31) | (uint32_t(exp - 15 + 127) << 23) | (mant << 13);
-    }
-    float f; std::memcpy(&f, &u, 4); return f;
-}
-
 } // namespace
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -269,17 +213,17 @@ private:
     ggml_context        * m_w_ctx = nullptr;
     ggml_backend_buffer_t m_w_buf = nullptr;
 
-    // Per-quantizer oproj: takes (8, T) → (512, T). Stored as (in=8, out=512) f16.
+    // Per-quantizer oproj: takes (8, T) → (512, T). Stored as (in=8, out=512) f32.
     std::array<ggml_tensor *, CODEC_NUM_VQ> m_q_oproj_w {};
     std::array<ggml_tensor *, CODEC_NUM_VQ> m_q_oproj_b {};
-    // Final quantizer.oproj: takes (512, T) → (768, T). (in=512, out=768) f16.
+    // Final quantizer.oproj: takes (512, T) → (768, T). (in=512, out=768) f32.
     ggml_tensor * m_quant_oproj_w = nullptr;
     ggml_tensor * m_quant_oproj_b = nullptr;
 
     // Encoder-only weights:
-    //   q.{i}.iproj: (in=512, out=8) f16, plus bias (8,)
-    //   quantizer.iproj: (in=768, out=512) f16, plus bias (512,)
-    //   codebook_normed[i]: (8, 1024) f16 — L2-normalized rows of codebook[i]
+    //   q.{i}.iproj: (in=512, out=8) f32, plus bias (8,)
+    //   quantizer.iproj: (in=768, out=512) f32, plus bias (512,)
+    //   codebook_normed[i]: (8, 1024) f32 — L2-normalized rows of codebook[i]
     std::array<ggml_tensor *, CODEC_NUM_VQ> m_q_iproj_w {};
     std::array<ggml_tensor *, CODEC_NUM_VQ> m_q_iproj_b {};
     ggml_tensor * m_quant_iproj_w = nullptr;
@@ -325,7 +269,7 @@ private:
     void validate_stage_(const Stage & S, const char * side) const;
     void compute_effective_weights_();
     void compute_normalized_codebooks_();
-    ggml_tensor * read_f16_to_host_(ggml_tensor * t, std::vector<uint16_t> & out) const;
+    ggml_tensor * read_float_to_host_(ggml_tensor * t, std::vector<float> & out) const;
 
     // Graph construction:
     ggml_tensor * build_layer_norm_(ggml_context * gctx, ggml_tensor * x,
@@ -549,30 +493,42 @@ void CodecGraphs::validate_stage_(const Stage & S, const char * side) const {
     check(S.oproj, "oproj", S.spec.d_model,   S.spec.output_dim);
 }
 
-// Read a backend tensor (f16) into a host f16 buffer. Returns the tensor
-// (unchanged) for convenience.
-ggml_tensor * CodecGraphs::read_f16_to_host_(ggml_tensor * t,
-                                              std::vector<uint16_t> & out) const {
-    if (t->type != GGML_TYPE_F16) {
-        throw std::runtime_error(std::string("read_f16_to_host_: expected f16 for ")
-                                 + (t->name[0] ? t->name : "<unnamed>"));
-    }
+// Read an unquantized backend tensor into a host f32 buffer. Sidecars may store
+// learned weights as BF16 and numerically sensitive quantizer tensors as F32;
+// legacy F16 sidecars remain readable.
+ggml_tensor * CodecGraphs::read_float_to_host_(ggml_tensor * t,
+                                               std::vector<float> & out) const {
     const size_t n = ggml_nelements(t);
     out.resize(n);
-    ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(uint16_t));
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
+        return t;
+    }
+
+    const ggml_type_traits * traits = ggml_get_type_traits(t->type);
+    if (!traits || !traits->to_float || traits->is_quantized) {
+        throw std::runtime_error(
+            std::string("read_float_to_host_: expected f16, bf16, or f32 for ")
+            + (t->name[0] ? t->name : "<unnamed>") + ", got "
+            + ggml_type_name(t->type));
+    }
+    std::vector<uint8_t> raw(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+    traits->to_float(raw.data(), out.data(), n);
     return t;
 }
 
 // Materialise effective post-weight-norm Conv1d weights for every quantizer
 // projection used during decoding (per-quantizer oproj + the global oproj).
 //
-// All source tensors are 3D (out, in, k=1) f16 in GGML ne order (1, in, out).
-// We compute the effective 2D weight (in, out) on the host and upload.
+// Source tensors are unquantized f16/bf16/f32 arrays in GGML ne order
+// (1, in, out). We compute the effective 2D weight (in, out) in f32 on the
+// host and upload it as f32, matching the reference quantizer math.
 void CodecGraphs::compute_effective_weights_() {
     auto * aux = m_owner.aux();
 
     // Build a fresh ggml_context big enough for all the descriptors (33 weights
-    // + 33 biases ≈ 66 tensors). Allocate as f16 on the same backend.
+    // + 33 biases ≈ 66 tensors). Allocate as f32 on the same backend.
     {
         ggml_init_params ip{};
         ip.mem_size   = ggml_tensor_overhead() * 200;
@@ -583,12 +539,12 @@ void CodecGraphs::compute_effective_weights_() {
     }
 
     auto make_w = [&](const std::string & name, int in_dim, int out_dim) -> ggml_tensor * {
-        ggml_tensor * t = ggml_new_tensor_2d(m_w_ctx, GGML_TYPE_F16, in_dim, out_dim);
+        ggml_tensor * t = ggml_new_tensor_2d(m_w_ctx, GGML_TYPE_F32, in_dim, out_dim);
         ggml_set_name(t, name.c_str());
         return t;
     };
     auto make_b = [&](const std::string & name, int out_dim) -> ggml_tensor * {
-        ggml_tensor * t = ggml_new_tensor_1d(m_w_ctx, GGML_TYPE_F16, out_dim);
+        ggml_tensor * t = ggml_new_tensor_1d(m_w_ctx, GGML_TYPE_F32, out_dim);
         ggml_set_name(t, name.c_str());
         return t;
     };
@@ -612,7 +568,7 @@ void CodecGraphs::compute_effective_weights_() {
 
     // Pre-allocate normalized codebooks (filled in compute_normalized_codebooks_)
     for (int i = 0; i < CODEC_NUM_VQ; ++i) {
-        ggml_tensor * t = ggml_new_tensor_2d(m_w_ctx, GGML_TYPE_F16,
+        ggml_tensor * t = ggml_new_tensor_2d(m_w_ctx, GGML_TYPE_F32,
                                               CODEC_CB_DIM, /*codebook_size=*/1024);
         ggml_set_name(t, ("cb_norm." + std::to_string(i)).c_str());
         m_codebook_normed[i] = t;
@@ -622,8 +578,8 @@ void CodecGraphs::compute_effective_weights_() {
     m_w_buf = ggml_backend_alloc_ctx_tensors(m_w_ctx, aux->backend);
     if (!m_w_buf) throw std::runtime_error("CodecGraphs: alloc_ctx_tensors for weight buf failed");
 
-    // Helper: reconstruct effective weight from wp0, wp1 (both f16 on device)
-    // and upload to dst (f16 on device).
+    // Helper: reconstruct an effective f32 weight from wp0 and wp1 and upload
+    // it to an f32 destination.
     auto reconstruct = [&](const std::string & wp0_name,
                            const std::string & wp1_name,
                            const std::string & bias_name,
@@ -644,44 +600,42 @@ void CodecGraphs::compute_effective_weights_() {
             throw std::runtime_error("compute_effective_weights_: wp1 shape mismatch for " + wp1_name);
         }
 
-        std::vector<uint16_t> wp0_f16, wp1_f16, bias_f16;
-        read_f16_to_host_(wp0_t, wp0_f16);
-        read_f16_to_host_(wp1_t, wp1_f16);
-        if (bias_t) read_f16_to_host_(bias_t, bias_f16);
+        std::vector<float> wp0, wp1, bias;
+        read_float_to_host_(wp0_t, wp0);
+        read_float_to_host_(wp1_t, wp1);
+        if (bias_t) read_float_to_host_(bias_t, bias);
 
         // Compute: weight[o, i] = wp0[o] * wp1[o, i] / sqrt(Σi wp1[o, i]^2)
         //
         // wp1 is laid out as (out, in, 1) row-major in PyTorch; equivalently
         // ne=(1, in, out) in GGML. The contiguous memory order is the same:
-        // varying along `in` is the inner stride. So wp1_f16 indexed linearly
+        // varying along `in` is the inner stride. So wp1 indexed linearly
         // in slot (o*in + i) corresponds to wp1[o, i].
-        std::vector<uint16_t> w_eff(size_t(in_dim) * size_t(out_dim));
+        std::vector<float> w_eff(size_t(in_dim) * size_t(out_dim));
         for (int o = 0; o < out_dim; ++o) {
-            float g = f16_bits_to_f32(wp0_f16[size_t(o)]);
+            float g = wp0[size_t(o)];
             float ssq = 0.0f;
             for (int i = 0; i < in_dim; ++i) {
-                float v = f16_bits_to_f32(wp1_f16[size_t(o) * size_t(in_dim) + size_t(i)]);
+                float v = wp1[size_t(o) * size_t(in_dim) + size_t(i)];
                 ssq += v * v;
             }
             float inv = (ssq > 0.0f) ? 1.0f / std::sqrt(ssq) : 0.0f;
             float scale = g * inv;
             for (int i = 0; i < in_dim; ++i) {
-                float v = f16_bits_to_f32(wp1_f16[size_t(o) * size_t(in_dim) + size_t(i)]);
+                float v = wp1[size_t(o) * size_t(in_dim) + size_t(i)];
                 // dst layout: ne=(in, out), index (i, o) → linear = o*in + i.
-                w_eff[size_t(o) * size_t(in_dim) + size_t(i)] = f32_to_f16_bits(scale * v);
+                w_eff[size_t(o) * size_t(in_dim) + size_t(i)] = scale * v;
             }
         }
 
-        ggml_backend_tensor_set(dst_w, w_eff.data(), 0, w_eff.size() * sizeof(uint16_t));
+        ggml_backend_tensor_set(dst_w, w_eff.data(), 0, w_eff.size() * sizeof(float));
         if (bias_t && dst_b) {
-            ggml_backend_tensor_set(dst_b, bias_f16.data(), 0,
-                                    bias_f16.size() * sizeof(uint16_t));
+            ggml_backend_tensor_set(dst_b, bias.data(), 0, bias.size() * sizeof(float));
         } else if (dst_b) {
             // Zero-fill if the upstream model has no bias (shouldn't happen with
             // WNConv1d, which defaults to bias=True, but be safe).
-            std::vector<uint16_t> zero(out_dim, 0);
-            ggml_backend_tensor_set(dst_b, zero.data(), 0,
-                                    zero.size() * sizeof(uint16_t));
+            std::vector<float> zero(out_dim, 0.0f);
+            ggml_backend_tensor_set(dst_b, zero.data(), 0, zero.size() * sizeof(float));
         }
     };
 
@@ -720,28 +674,28 @@ void CodecGraphs::compute_effective_weights_() {
 void CodecGraphs::compute_normalized_codebooks_() {
     constexpr int CB_SIZE = 1024;
     for (int i = 0; i < CODEC_NUM_VQ; ++i) {
-        std::vector<uint16_t> cb_f16;
-        read_f16_to_host_(m_codebook[i], cb_f16);
-        if (cb_f16.size() != size_t(CB_SIZE) * size_t(CODEC_CB_DIM)) {
+        std::vector<float> cb;
+        read_float_to_host_(m_codebook[i], cb);
+        if (cb.size() != size_t(CB_SIZE) * size_t(CODEC_CB_DIM)) {
             throw std::runtime_error("compute_normalized_codebooks_: shape mismatch for q." +
                                       std::to_string(i) + ".codebook");
         }
-        std::vector<uint16_t> cb_norm(cb_f16.size());
+        std::vector<float> cb_norm(cb.size());
         // codebook[r, c] is at flat index r*8 + c (rows of length 8).
         for (int r = 0; r < CB_SIZE; ++r) {
             float ssq = 0.0f;
             for (int c = 0; c < CODEC_CB_DIM; ++c) {
-                float v = f16_bits_to_f32(cb_f16[size_t(r) * CODEC_CB_DIM + size_t(c)]);
+                float v = cb[size_t(r) * CODEC_CB_DIM + size_t(c)];
                 ssq += v * v;
             }
             float inv = (ssq > 0.0f) ? 1.0f / std::sqrt(ssq) : 0.0f;
             for (int c = 0; c < CODEC_CB_DIM; ++c) {
-                float v = f16_bits_to_f32(cb_f16[size_t(r) * CODEC_CB_DIM + size_t(c)]);
-                cb_norm[size_t(r) * CODEC_CB_DIM + size_t(c)] = f32_to_f16_bits(v * inv);
+                float v = cb[size_t(r) * CODEC_CB_DIM + size_t(c)];
+                cb_norm[size_t(r) * CODEC_CB_DIM + size_t(c)] = v * inv;
             }
         }
         ggml_backend_tensor_set(m_codebook_normed[i], cb_norm.data(), 0,
-                                cb_norm.size() * sizeof(uint16_t));
+                                cb_norm.size() * sizeof(float));
     }
 }
 
@@ -1147,7 +1101,7 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
     for (int i = 0; i < n_vq; ++i) {
         // (codebook_dim=8, T) via embedding lookup → f32 (get_rows promotes)
         ggml_tensor * z = ggml_get_rows(gctx, m_codebook[i], codes_in[i]);
-        // Conv1d 8 → 512 (kernel=1). w stored as (in=8, out=512) f16.
+        // Conv1d 8 → 512 (kernel=1). w stored as (in=8, out=512) f32.
         z = mm_(gctx, m_q_oproj_w[i], z);                   // (512, T) f32
         z = ggml_add(gctx, z, to_f32_(gctx, m_q_oproj_b[i]));        // broadcast bias
         sum = sum ? ggml_add(gctx, sum, z) : z;
